@@ -1,8 +1,1 @@
-echo node_modules/ > .gitignore
-echo dist_electron/ >> .gitignore
-echo backend/dist/ >> .gitignore
-echo frontend/dist/ >> .gitignore
-echo ffmpeg_bin/ >> .gitignore
-echo __pycache__/ >> .gitignore
-echo *.pyc >> .gitignore
-echo .env >> .gitignore
+(echo node_modules/&&echo dist_electron/&&echo backend/dist/&&echo frontend/dist/&&echo ffmpeg_bin/&&echo __pycache__/&&echo *.pyc&&echo .env) > .gitignore
