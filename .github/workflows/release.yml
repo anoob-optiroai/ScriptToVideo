@@ -3,15 +3,8 @@ name: Build & Release
 on:
   push:
     tags:
-      - "v*.*.*"          # triggered by: git tag v1.2.3 && git push --tags
-  workflow_dispatch:       # allow manual run from GitHub Actions UI
-    inputs:
-      publish:
-        description: "Publish to GitHub Releases?"
-        required: true
-        default: "true"
-        type: choice
-        options: ["true", "false"]
+      - "v*.*.*"       # git tag v1.2.3 && git push --tags
+  workflow_dispatch:   # manual run from the Actions UI (always publishes)
 
 jobs:
   # ── Windows .exe ─────────────────────────────────────────────────────────────
@@ -23,7 +16,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
+      - name: Set up Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -33,22 +26,19 @@ jobs:
         with:
           python-version: "3.12"
 
-      # ── 1. Build React frontend ───────────────────────────────────────────
       - name: Build frontend
         working-directory: frontend
         run: |
           npm ci
           npm run build
 
-      # ── 2. Build PyInstaller backend ──────────────────────────────────────
-      - name: Build backend
+      - name: Build backend (PyInstaller)
         working-directory: backend
         run: |
           pip install -r requirements.txt -q
           pip install pyinstaller -q
           pyinstaller scriptovideo.spec --noconfirm
 
-      # ── 3. Download FFmpeg for Windows ────────────────────────────────────
       - name: Download FFmpeg (Windows)
         shell: pwsh
         run: |
@@ -60,19 +50,14 @@ jobs:
           New-Item -ItemType Directory -Force -Path ffmpeg_bin | Out-Null
           Copy-Item $exe.FullName -Destination "ffmpeg_bin\ffmpeg.exe"
 
-      # ── 4. Build Electron Windows installer ──────────────────────────────
-      - name: Build Electron (Windows)
+      - name: Build Electron installer (Windows)
         working-directory: electron
+        shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           npm ci
-          if ("${{ github.event_name }}" -eq "push" -or "${{ github.event.inputs.publish }}" -eq "true") {
-            npx electron-builder --win --publish always
-          } else {
-            npx electron-builder --win --publish never
-          }
-        shell: pwsh
+          npx electron-builder --win --publish always
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
@@ -92,7 +77,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
+      - name: Set up Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -102,22 +87,19 @@ jobs:
         with:
           python-version: "3.12"
 
-      # ── 1. Build React frontend ───────────────────────────────────────────
       - name: Build frontend
         working-directory: frontend
         run: |
           npm ci
           npm run build
 
-      # ── 2. Build PyInstaller backend ──────────────────────────────────────
-      - name: Build backend
+      - name: Build backend (PyInstaller)
         working-directory: backend
         run: |
           pip3 install -r requirements.txt -q
           pip3 install pyinstaller -q
           pyinstaller scriptovideo.spec --noconfirm
 
-      # ── 3. Download FFmpeg for macOS ──────────────────────────────────────
       - name: Download FFmpeg (macOS)
         run: |
           brew install ffmpeg --quiet || true
@@ -128,21 +110,14 @@ jobs:
             chmod +x ffmpeg_bin/ffmpeg
           fi
 
-      # ── 4. Build Electron macOS DMG ───────────────────────────────────────
-      - name: Build Electron (macOS)
+      - name: Build Electron DMG (macOS)
         working-directory: electron
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          # Code-signing is skipped — add CSC_LINK / CSC_KEY_PASSWORD here
-          # when you have an Apple Developer certificate
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
           npm ci
-          if [[ "${{ github.event_name }}" == "push" || "${{ github.event.inputs.publish }}" == "true" ]]; then
-            npx electron-builder --mac --publish always
-          else
-            npx electron-builder --mac --publish never
-          fi
+          npx electron-builder --mac --publish always
 
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
@@ -153,31 +128,30 @@ jobs:
             dist_electron/latest-mac.yml
           if-no-files-found: error
 
-  # ── Create GitHub Release ─────────────────────────────────────────────────────
+  # ── GitHub Release ────────────────────────────────────────────────────────────
   release:
-    name: Create GitHub Release
+    name: Publish GitHub Release
     needs: [build-windows, build-mac]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event.inputs.publish == 'true'
 
     steps:
-      - name: Download all artifacts
+      - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ github.ref_name }}
           name: ScriptToVideo ${{ github.ref_name }}
           draft: false
           prerelease: false
+          generate_release_notes: true
           files: |
             artifacts/windows-installer/*.exe
             artifacts/windows-installer/latest.yml
             artifacts/macos-dmg/*.dmg
             artifacts/macos-dmg/latest-mac.yml
-          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
