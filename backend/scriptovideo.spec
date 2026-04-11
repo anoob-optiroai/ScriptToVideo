@@ -35,14 +35,29 @@ hidden_imports = [
     "uvicorn.lifespan", "uvicorn.lifespan.on", "uvicorn.lifespan.off",
     # FastAPI / Starlette
     "starlette.routing", "starlette.staticfiles", "starlette.responses",
-    # Pydantic
-    "pydantic", "pydantic_settings", "pydantic.deprecated.class_validators",
+    # Pydantic v2 (pydantic_core is the Rust extension — must be explicit)
+    "pydantic", "pydantic_core", "pydantic_settings",
+    "pydantic.deprecated.class_validators",
+    "pydantic.v1",
     # multipart (file uploads)
     "multipart", "python_multipart",
     # Pillow
     "PIL", "PIL._imaging", "PIL.Image", "PIL.ImageDraw", "PIL.ImageFont",
-    # numpy (used by waveform / animation code)
-    "numpy",
+    "PIL.ImageFilter", "PIL.ImageEnhance", "PIL.ImageColor",
+    # numpy (used by animation / frame generation code)
+    "numpy", "numpy.core", "numpy.core._multiarray_umath",
+    "numpy.core._multiarray_tests",
+    # python-pptx (used by slides router — lazy imported but must be bundled)
+    "pptx", "pptx.util", "pptx.exc",
+    "pptx.enum.shapes", "pptx.enum.text", "pptx.enum.dml",
+    "pptx.dml.color",
+    "pptx.oxml", "pptx.oxml.ns",
+    "pptx.presentation",
+    "pptx.shapes.autoshape", "pptx.shapes.base",
+    "pptx.shapes.picture", "pptx.shapes.placeholder",
+    "pptx.text.text",
+    # lxml (required by python-pptx)
+    "lxml", "lxml.etree", "lxml._elementpath", "lxml.html",
     # email (used by some dependencies)
     "email.mime.multipart", "email.mime.text",
     # Google TTS / OpenAI / ElevenLabs
@@ -51,6 +66,12 @@ hidden_imports = [
     "requests", "urllib3",
     # aiofiles
     "aiofiles",
+    # h11 (HTTP/1.1 parser used by uvicorn)
+    "h11",
+    # anyio (async backend used by FastAPI/Starlette)
+    "anyio", "anyio._backends._asyncio",
+    # httpx (used by openai client)
+    "httpx",
 ]
 
 a = Analysis(

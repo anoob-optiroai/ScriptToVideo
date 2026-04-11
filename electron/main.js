@@ -191,12 +191,30 @@ function startBackend() {
     detached: false,
   });
 
-  backendProcess.stdout.on("data", (d) => process.stdout.write(`[backend] ${d}`));
-  backendProcess.stderr.on("data", (d) => process.stderr.write(`[backend] ${d}`));
+  // Write backend output to a log file in userData so crashes can be diagnosed
+  const logPath = path.join(getUserDataPath(), "backend.log");
+  const logStream = fs.createWriteStream(logPath, { flags: "a" });
+  logStream.write(`\n\n=== Backend started ${new Date().toISOString()} ===\n`);
+
+  let stderrBuf = "";
+  backendProcess.stdout.on("data", (d) => {
+    process.stdout.write(`[backend] ${d}`);
+    logStream.write(d);
+  });
+  backendProcess.stderr.on("data", (d) => {
+    process.stderr.write(`[backend] ${d}`);
+    logStream.write(d);
+    stderrBuf += d.toString();
+    if (stderrBuf.length > 4000) stderrBuf = stderrBuf.slice(-4000);
+  });
   backendProcess.on("exit", (code) => {
+    logStream.end(`\n=== Backend exited code ${code} ===\n`);
     console.log(`[electron] Backend exited with code ${code}`);
     if (code !== 0 && mainWindow) {
-      dialog.showErrorBox("Backend crashed", `The backend process exited unexpectedly (code ${code}).`);
+      const detail = stderrBuf.trim()
+        ? `Error output:\n${stderrBuf.trim().slice(-1500)}\n\nLog: ${logPath}`
+        : `Log saved to: ${logPath}`;
+      dialog.showErrorBox("Backend crashed", `The backend process exited unexpectedly (code ${code}).\n\n${detail}`);
     }
   });
 }
