@@ -10,3 +10,5 @@ google-cloud-texttospeech==2.16.3
 ffmpeg-python==0.2.0
 Pillow==10.3.0
 aiofiles==23.2.1
+python-pptx>=0.6.21
+numpy>=1.26.0
