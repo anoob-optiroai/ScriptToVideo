@@ -1,0 +1,403 @@
+"""
+Audio generation router.
+Accepts: Google Doc URL, Word file upload (.docx), or plain text.
+Returns: job_id for polling, plus the final .mp3 URL when done.
+"""
+import os
+import re
+from pathlib import Path
+from typing import Optional
+
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks
+
+from config import settings
+from job_store import job_store
+
+router = APIRouter()
+
+# ── Static voice lists for non-ElevenLabs providers ─────────────────────────
+
+OPENAI_VOICES = [
+    {"id": "alloy",   "name": "Alloy (Neutral)"},
+    {"id": "echo",    "name": "Echo (Male)"},
+    {"id": "fable",   "name": "Fable (British)"},
+    {"id": "onyx",    "name": "Onyx (Male, deep)"},
+    {"id": "nova",    "name": "Nova (Female, warm)"},
+    {"id": "shimmer", "name": "Shimmer (Female, soft)"},
+]
+
+GOOGLE_VOICES = [
+    {"id": "en-US", "name": "English (US)"},
+    {"id": "en-GB", "name": "English (UK)"},
+    {"id": "en-AU", "name": "English (Australia)"},
+]
+
+
+def fetch_elevenlabs_voices():
+    """Fetch real voices from the user's ElevenLabs account dynamically."""
+    import requests
+    try:
+        response = requests.get(
+            "https://api.elevenlabs.io/v1/voices",
+            headers={"xi-api-key": settings.elevenlabs_api_key},
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+        voices = []
+        for v in data.get("voices", []):
+            label = v.get("name", "Unknown")
+            category = v.get("category", "")
+            if category:
+                label = f"{label} ({category})"
+            voices.append({"id": v["voice_id"], "name": label})
+        return voices if voices else [{"id": "", "name": "No voices found"}]
+    except Exception as e:
+        return [{"id": "", "name": f"Could not load voices: {e}"}]
+
+
+@router.get("/config")
+def get_audio_config():
+    """Return the current TTS provider and available voices for the UI."""
+    provider = settings.tts_provider.lower()
+
+    if provider == "elevenlabs":
+        voices = fetch_elevenlabs_voices()
+    elif provider == "openai":
+        voices = OPENAI_VOICES
+    elif provider == "google":
+        voices = GOOGLE_VOICES
+    else:
+        voices = OPENAI_VOICES
+
+    return {
+        "provider": provider,
+        "voices": voices,
+        "default_voice": voices[0]["id"] if voices else "",
+    }
+
+
+# ── Text extraction helpers ──────────────────────────────────────────────────
+
+def extract_text_from_docx(file_bytes: bytes) -> str:
+    from docx import Document
+    import io
+    doc = Document(io.BytesIO(file_bytes))
+    return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+
+
+def extract_text_from_google_doc(url: str) -> str:
+    import requests
+    match = re.search(r"/d/([a-zA-Z0-9_-]+)", url)
+    if not match:
+        raise ValueError("Could not extract Google Doc ID from URL")
+    doc_id = match.group(1)
+    export_url = f"https://docs.google.com/document/d/{doc_id}/export?format=txt"
+    response = requests.get(export_url, timeout=30)
+    response.raise_for_status()
+    return response.text
+
+
+# ── Text chunking ────────────────────────────────────────────────────────────
+
+def split_text_into_chunks(text: str, max_chars: int = 9500) -> list:
+    """
+    Split text into chunks of max_chars, breaking only at sentence boundaries.
+    This avoids the ElevenLabs 10,000 character limit per request.
+    """
+    # Split into sentences
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    chunks = []
+    current = ""
+    for sentence in sentences:
+        # If a single sentence is too long, split it at commas/newlines
+        if len(sentence) > max_chars:
+            parts = re.split(r'(?<=,)\s+|\n', sentence)
+            for part in parts:
+                if len(current) + len(part) + 1 <= max_chars:
+                    current += (" " if current else "") + part
+                else:
+                    if current:
+                        chunks.append(current.strip())
+                    current = part
+        elif len(current) + len(sentence) + 1 <= max_chars:
+            current += (" " if current else "") + sentence
+        else:
+            if current:
+                chunks.append(current.strip())
+            current = sentence
+    if current:
+        chunks.append(current.strip())
+    return chunks
+
+
+def concatenate_audio_files(chunk_paths: list, output_path: str):
+    """Join multiple MP3 chunks into one file using FFmpeg."""
+    import subprocess
+
+    # Always use absolute paths so FFmpeg doesn't resolve them relative to the
+    # list file's directory (which would double the path on Windows).
+    abs_output = os.path.abspath(output_path)
+    abs_chunks = [os.path.abspath(p) for p in chunk_paths]
+
+    list_file = abs_output + "_list.txt"
+    with open(list_file, "w", encoding="utf-8") as f:
+        for p in abs_chunks:
+            # Forward slashes keep FFmpeg happy on Windows
+            f.write("file '{}'\n".format(p.replace("\\", "/")))
+
+    cmd = [
+        settings.ffmpeg_binary, "-y",
+        "-f", "concat", "-safe", "0",
+        "-i", list_file,
+        "-c", "copy",
+        abs_output,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    try:
+        os.remove(list_file)
+    except Exception:
+        pass
+    if result.returncode != 0:
+        raise RuntimeError(f"FFmpeg concat error: {result.stderr[-300:]}")
+
+
+# ── TTS providers ────────────────────────────────────────────────────────────
+
+def tts_elevenlabs_chunk(text: str, voice_id: str, output_path: str):
+    """Send one chunk to ElevenLabs (max 9500 chars)."""
+    import requests
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    headers = {
+        "xi-api-key": settings.elevenlabs_api_key,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "text": text,
+        "model_id": "eleven_multilingual_v2",
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+    }
+    response = requests.post(url, json=payload, headers=headers, timeout=120)
+    if not response.ok:
+        try:
+            detail = response.json().get("detail", {})
+            msg = detail.get("message", response.text) if isinstance(detail, dict) else str(detail)
+        except Exception:
+            msg = response.text
+        raise RuntimeError(f"ElevenLabs error {response.status_code}: {msg}")
+    with open(output_path, "wb") as f:
+        f.write(response.content)
+
+
+def tts_elevenlabs(text: str, voice_id: str, output_path: str, job=None):
+    """Split long text into chunks and concatenate audio output."""
+    chunks = split_text_into_chunks(text, max_chars=9500)
+    if len(chunks) == 1:
+        tts_elevenlabs_chunk(chunks[0], voice_id, output_path)
+        return
+
+    chunk_paths = []
+    base = output_path.replace(".mp3", "")
+    for i, chunk in enumerate(chunks):
+        if job:
+            pct = 30 + int((i / len(chunks)) * 60)
+            job.update(progress=pct, message=f"Generating audio part {i+1} of {len(chunks)}...")
+        chunk_path = f"{base}_part{i}.mp3"
+        tts_elevenlabs_chunk(chunk, voice_id, chunk_path)
+        chunk_paths.append(chunk_path)
+
+    concatenate_audio_files(chunk_paths, output_path)
+
+    # Clean up chunk files
+    for p in chunk_paths:
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+
+
+def tts_openai_chunk(text: str, voice: str, output_path: str, speed: float = 1.0):
+    """Send one chunk to OpenAI TTS (max 4000 chars)."""
+    from openai import OpenAI
+    client = OpenAI(api_key=settings.openai_api_key)
+    response = client.audio.speech.create(
+        model="tts-1-hd",
+        voice=voice,
+        input=text,
+        speed=speed,
+    )
+    response.stream_to_file(output_path)
+
+
+def tts_openai(text: str, voice: str, output_path: str, speed: float = 1.0, job=None):
+    """Split long text into chunks and concatenate audio output."""
+    chunks = split_text_into_chunks(text, max_chars=4000)
+    if len(chunks) == 1:
+        tts_openai_chunk(chunks[0], voice, output_path, speed)
+        return
+
+    chunk_paths = []
+    base = output_path.replace(".mp3", "")
+    for i, chunk in enumerate(chunks):
+        if job:
+            pct = 30 + int((i / len(chunks)) * 60)
+            job.update(progress=pct, message=f"Generating audio part {i+1} of {len(chunks)}...")
+        chunk_path = f"{base}_part{i}.mp3"
+        tts_openai_chunk(chunk, voice, chunk_path, speed)
+        chunk_paths.append(chunk_path)
+
+    concatenate_audio_files(chunk_paths, output_path)
+
+    # Clean up chunk files
+    for p in chunk_paths:
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+
+
+def tts_google(text: str, language_code: str, output_path: str):
+    from google.cloud import texttospeech
+    client = texttospeech.TextToSpeechClient()
+    synthesis_input = texttospeech.SynthesisInput(text=text)
+    voice = texttospeech.VoiceSelectionParams(
+        language_code=language_code,
+        ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL,
+    )
+    audio_config = texttospeech.AudioConfig(
+        audio_encoding=texttospeech.AudioEncoding.MP3
+    )
+    response = client.synthesize_speech(
+        input=synthesis_input, voice=voice, audio_config=audio_config
+    )
+    with open(output_path, "wb") as f:
+        f.write(response.audio_content)
+
+
+# ── Background worker ────────────────────────────────────────────────────────
+
+def run_audio_generation(job_id: str, text: str, voice: str, speed: float, language: str):
+    job = job_store.get(job_id)
+    try:
+        job.update(status="processing", progress=10, message="Preparing text...")
+
+        output_filename = f"{job_id}.mp3"
+        output_path = str(Path(settings.audio_output_dir) / output_filename)
+
+        provider = settings.tts_provider.lower()
+        job.update(progress=30, message=f"Generating audio with {provider}...")
+
+        if provider == "elevenlabs":
+            tts_elevenlabs(text, voice, output_path, job=job)
+        elif provider == "openai":
+            openai_voice = voice if voice else "alloy"
+            tts_openai(text, openai_voice, output_path, speed, job=job)
+        elif provider == "google":
+            tts_google(text, language, output_path)
+        else:
+            raise ValueError(f"Unknown TTS provider: {provider}")
+
+        job.update(
+            status="done",
+            progress=100,
+            message="Audio generated successfully!",
+            result={
+                "audio_url": f"/downloads/{output_filename}",
+                "filename": output_filename,
+            },
+        )
+    except Exception as e:
+        job.update(error=str(e))
+
+
+# ── Endpoints ────────────────────────────────────────────────────────────────
+
+@router.post("/upload")
+async def upload_audio(file: UploadFile = File(...)):
+    """Accept a pre-recorded audio file and save it to the audio output directory."""
+    allowed = (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac")
+    if not file.filename.lower().endswith(allowed):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported audio format. Allowed: {', '.join(allowed)}"
+        )
+    import uuid
+    ext = os.path.splitext(file.filename)[1].lower()
+    filename = f"{uuid.uuid4()}{ext}"
+    output_path = str(Path(settings.audio_output_dir) / filename)
+    with open(output_path, "wb") as f:
+        f.write(await file.read())
+    return {"audio_url": f"/downloads/{filename}", "filename": filename}
+
+
+@router.get("/duration/{filename}")
+def get_audio_duration(filename: str):
+    """Return the duration (in seconds) of a generated audio file."""
+    import subprocess, json
+    audio_path = str(Path(settings.audio_output_dir) / filename)
+    if not os.path.exists(audio_path):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail=f"Audio file not found: {filename}")
+
+    # Derive ffprobe path from ffmpeg setting
+    import shutil
+    ffmpeg = settings.ffmpeg_binary
+    if os.sep in ffmpeg or "/" in ffmpeg:
+        ext = ".exe" if ffmpeg.lower().endswith(".exe") else ""
+        candidate = os.path.join(os.path.dirname(ffmpeg), f"ffprobe{ext}")
+        probe = candidate if os.path.exists(candidate) else "ffprobe"
+    else:
+        probe = "ffprobe" if shutil.which("ffprobe") else ffmpeg.replace("ffmpeg", "ffprobe")
+
+    result = subprocess.run(
+        [probe, "-v", "quiet", "-print_format", "json", "-show_streams", audio_path],
+        capture_output=True, text=True, timeout=30,
+    )
+    data = json.loads(result.stdout or "{}")
+    duration = 0.0
+    for stream in data.get("streams", []):
+        if "duration" in stream:
+            duration = float(stream["duration"])
+            break
+
+    return {"filename": filename, "duration": duration}
+
+
+@router.post("/generate")
+async def generate_audio(
+    background_tasks: BackgroundTasks,
+    text: Optional[str] = Form(None),
+    google_doc_url: Optional[str] = Form(None),
+    voice: Optional[str] = Form(None),
+    speed: Optional[float] = Form(1.0),
+    language: Optional[str] = Form("en-US"),
+    file: Optional[UploadFile] = File(None),
+):
+    script_text = None
+
+    if text and text.strip():
+        script_text = text.strip()
+    elif google_doc_url:
+        try:
+            script_text = extract_text_from_google_doc(google_doc_url)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not fetch Google Doc: {e}")
+    elif file:
+        file_bytes = await file.read()
+        if file.filename.endswith(".docx"):
+            try:
+                script_text = extract_text_from_docx(file_bytes)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Could not read .docx: {e}")
+        elif file.filename.endswith(".txt"):
+            script_text = file_bytes.decode("utf-8", errors="ignore")
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported file type. Use .docx or .txt")
+
+    if not script_text:
+        raise HTTPException(status_code=400, detail="No script text provided.")
+
+    job = job_store.create()
+    background_tasks.add_task(run_audio_generation, job.job_id, script_text, voice, speed, language)
+
+    return {"job_id": job.job_id, "status": "pending"}
