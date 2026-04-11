@@ -67,21 +67,19 @@
 
     "mac": {
       "target": [
-        {
-          "target": "dmg",
-          "arch":   ["x64", "arm64"]
-        }
+        { "target": "dmg", "arch": "x64"   },
+        { "target": "dmg", "arch": "arm64" }
       ],
       "icon":     "assets/icon.icns",
       "category": "public.app-category.productivity",
-      "hardenedRuntime": true,
+      "hardenedRuntime": false,
       "gatekeeperAssess": false
     },
 
     "dmg": {
-      "title":   "${productName} ${version}",
-      "icon":    "assets/icon.icns",
-      "window":  { "width": 540, "height": 380 },
+      "title":      "${productName} ${version}",
+      "background": null,
+      "window":     { "width": 540, "height": 380 },
       "contents": [
         { "x": 140, "y": 200, "type": "file"    },
         { "x": 400, "y": 200, "type": "link", "path": "/Applications" }

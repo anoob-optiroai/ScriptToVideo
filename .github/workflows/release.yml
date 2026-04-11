@@ -1,0 +1,172 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"       # git tag v1.2.3 && git push --tags
+  workflow_dispatch:   # manual run from the Actions UI (always publishes)
+
+jobs:
+  # ── Windows .exe ─────────────────────────────────────────────────────────────
+  build-windows:
+    name: Windows installer
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build backend (PyInstaller)
+        working-directory: backend
+        run: |
+          pip install -r requirements.txt -q
+          pip install pyinstaller -q
+          pyinstaller scriptovideo.spec --noconfirm
+
+      - name: Download FFmpeg (Windows)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+          $zip = "$env:TEMP\ffmpeg_win.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          Expand-Archive -Path $zip -DestinationPath "$env:TEMP\ffmpeg_extract" -Force
+          $exe = Get-ChildItem "$env:TEMP\ffmpeg_extract" -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+          New-Item -ItemType Directory -Force -Path ffmpeg_bin | Out-Null
+          Copy-Item $exe.FullName -Destination "ffmpeg_bin\ffmpeg.exe"
+
+      - name: Build Electron installer (Windows)
+        working-directory: electron
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          npm ci
+          npx electron-builder --win --publish always
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: |
+            dist_electron/*.exe
+            dist_electron/latest.yml
+          if-no-files-found: error
+
+  # ── macOS .dmg ───────────────────────────────────────────────────────────────
+  build-mac:
+    name: macOS DMG
+    runs-on: macos-13   # Intel x64 — macos-latest (arm64) has hdiutil/DMG issues with electron-builder
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate icon.icns from icon.png
+        run: |
+          mkdir -p electron/assets/icon.iconset
+          sips -z 16 16     electron/assets/icon.png --out electron/assets/icon.iconset/icon_16x16.png
+          sips -z 32 32     electron/assets/icon.png --out electron/assets/icon.iconset/icon_16x16@2x.png
+          sips -z 32 32     electron/assets/icon.png --out electron/assets/icon.iconset/icon_32x32.png
+          sips -z 64 64     electron/assets/icon.png --out electron/assets/icon.iconset/icon_32x32@2x.png
+          sips -z 128 128   electron/assets/icon.png --out electron/assets/icon.iconset/icon_128x128.png
+          sips -z 256 256   electron/assets/icon.png --out electron/assets/icon.iconset/icon_128x128@2x.png
+          sips -z 256 256   electron/assets/icon.png --out electron/assets/icon.iconset/icon_256x256.png
+          sips -z 512 512   electron/assets/icon.png --out electron/assets/icon.iconset/icon_256x256@2x.png
+          sips -z 512 512   electron/assets/icon.png --out electron/assets/icon.iconset/icon_512x512.png
+          iconutil -c icns electron/assets/icon.iconset --output electron/assets/icon.icns
+          echo "Generated icon.icns successfully"
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build backend (PyInstaller)
+        working-directory: backend
+        run: |
+          pip3 install -r requirements.txt -q
+          pip3 install pyinstaller -q
+          pyinstaller scriptovideo.spec --noconfirm
+
+      - name: Download FFmpeg (macOS)
+        run: |
+          brew install ffmpeg --quiet || true
+          mkdir -p ffmpeg_bin
+          BREW_FFMPEG="$(brew --prefix)/bin/ffmpeg"
+          if [ -f "$BREW_FFMPEG" ]; then
+            cp "$BREW_FFMPEG" ffmpeg_bin/ffmpeg
+            chmod +x ffmpeg_bin/ffmpeg
+          fi
+
+      - name: Build Electron DMG (macOS)
+        working-directory: electron
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          npm ci
+          npx electron-builder --mac --publish always
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: |
+            dist_electron/*.dmg
+            dist_electron/latest-mac.yml
+          if-no-files-found: error
+
+  # ── GitHub Release ────────────────────────────────────────────────────────────
+  release:
+    name: Publish GitHub Release
+    needs: [build-windows, build-mac]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ScriptToVideo ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            artifacts/windows-installer/*.exe
+            artifacts/windows-installer/latest.yml
+            artifacts/macos-dmg/*.dmg
+            artifacts/macos-dmg/latest-mac.yml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
