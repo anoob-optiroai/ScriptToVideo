@@ -893,48 +893,44 @@ def _apply_alpha_transitions(
     slide_durations: list = None,   # optional: avoids probing each clip
 ) -> str:
     """
-    Composite the custom transition clip over each slide cut so that it
-    OVERLAPS the end of the outgoing clip and the start of the incoming clip.
+    Composite the transition clip at each slide cut (trim + overlay + concat).
 
-    How it works
-    ────────────
-    1.  Concatenate all slide clips into a single base video (hard cuts).
-    2.  Compute the cut points (seconds) = cumulative slide durations.
-    3.  For every cut point T, offset the transition clip by (T - overlap_secs)
-        using setpts, then overlay it with format=auto so the alpha channel is
-        respected.  eof_action=pass restores the base video after the transition
-        finishes.
-    4.  Chain all overlays and encode once.
-
-    Timeline illustration (overlap = 15 frames at 25 fps = 0.60 s):
+    Timeline illustration (overlap = 15 frames @ 25 fps = 0.60 s):
         ┌──── slide A ────┬──── slide B ────┐
-                    ↑ cut point T  (= transition frame 15 at 25 fps)
-        ┌──── slide A ───[=== trans ===]─────────── slide B ──────┐
-                       ↑ overlay starts at T - 0.60 s
-    NOTE: fps here is the transition clip's frame rate (25), which also
-    matches the base video fps.  The hard cut in the base video aligns with
-    exactly frame 15 of the transition — the frame where the screen is fully
-    covered — so the cover phase hides the cut and the reveal phase uncovers
-    the incoming slide seamlessly.
+                          ↑ cut point T
+        ┌── slide A ──[=== trans ===]── slide B ──┐
+                     ↑ T-0.60s        ↑ T+0.60s
+
+    Old approach (SLOW): chain N overlays on the full base video → O(N × D).
+    For 30 transitions on a 47-minute video this times out at 900 s.
+
+    New approach (FAST): split the base into segments, apply each overlay only
+    to the short (~1.2 s) transition window, then concat → O(D) regardless of N.
+
+    FFmpeg filter graph:
+        [base] ──split──► trim[plain0] ──────────────────────────► concat → out
+                        ► trim[window0] ──overlay(trans) ──────────►
+                        ► trim[plain1] ──────────────────────────────►
+                        ► trim[window1] ──overlay(trans) ──────────►
+                          ...
     """
     overlap_secs = overlap_frames / fps
-    ffmpeg = settings.ffmpeg_binary
+    ffmpeg       = settings.ffmpeg_binary
+    w, h         = width, height
+    VIDEO_FPS    = 25
 
-    # ── Step 1: measure clip durations BEFORE building base (clips still exist)
+    # ── 1. Measure clip durations ──────────────────────────────────────────
     if slide_durations and len(slide_durations) == len(slide_clips):
-        clip_durs = slide_durations
+        clip_durs = list(slide_durations)
     else:
         clip_durs = [_get_video_duration(p) for p in slide_clips]
 
-    # Quantize each clip duration to the nearest video-frame boundary (1/25 s).
-    # Without this, floating-point accumulation in cut_times grows to 2–3 frames
-    # of error by slide 20+, causing the transition overlay to land at the wrong
-    # moment.  Rounding to the nearest frame keeps all cut_times sub-frame accurate.
-    VIDEO_FPS = 25
-    clip_durs = [round(round(d * VIDEO_FPS) / VIDEO_FPS, 6) for d in clip_durs]
+    # Quantize to frame boundaries using integer arithmetic (zero float drift).
+    frame_counts = [round(d * VIDEO_FPS) for d in clip_durs]
+    clip_durs    = [fc / VIDEO_FPS for fc in frame_counts]
 
-    # ── Step 2: build base video (all slides, hard cuts) ─────────────────────
-    base = abs_out + "_base.mp4"
+    # ── 2. Build base video (slide clips joined with hard cuts) ───────────
+    base      = abs_out + "_base.mp4"
     list_file = abs_out + "_base_cl.txt"
     with open(list_file, "w", encoding="utf-8") as f:
         for p in slide_clips:
@@ -951,19 +947,18 @@ def _apply_alpha_transitions(
     if r.returncode != 0:
         raise RuntimeError(f"Base concat error: {r.stderr[-200:]}")
 
-    # Clean up slide clips now that base is built
     for p in slide_clips:
         try:
             os.remove(p)
         except Exception:
             pass
 
-    # ── Step 3: compute cut points (cumulative durations) ─────────────────────
+    # ── 3. Cut points — integer frame accumulation (no drift) ─────────────
     cut_times = []
-    t_acc = 0.0
-    for d in clip_durs[:-1]:   # last slide has no transition after it
-        t_acc += d
-        cut_times.append(round(t_acc, 4))
+    frame_acc = 0
+    for fc in frame_counts[:-1]:   # last slide has no transition after it
+        frame_acc += fc
+        cut_times.append(frame_acc / VIDEO_FPS)   # single division per cut
 
     if not cut_times:
         try:
@@ -972,46 +967,96 @@ def _apply_alpha_transitions(
             pass
         return abs_out
 
-    # ── Step 3: build filter_complex with chained overlays ────────────────────
-    # Inputs: [0] base, [1..N] one copy of transition per cut
-    n_cuts   = len(cut_times)
-    w, h     = width, height
-    scale_vf = (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
-                f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2")
+    # ── 4. Transition clip duration ────────────────────────────────────────
+    trans_dur = _get_video_duration(transition_clip)
+    if trans_dur <= 0:
+        trans_dur = (2 * overlap_frames) / VIDEO_FPS
 
-    input_args = [ffmpeg, "-y", "-i", base]
-    for _ in cut_times:
-        input_args += ["-i", transition_clip]
+    base_dur  = sum(clip_durs)
+    scale_vf  = (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                 f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2")
+    ONE_FRAME = 1.0 / VIDEO_FPS
 
-    filter_parts = []
-    prev_label   = "0:v"
+    # ── 5. Segment list ────────────────────────────────────────────────────
+    # Each entry: ("plain", t0, t1)  or  ("overlay", t0, t1)
+    segments = []
+    prev_end = 0.0
 
-    for idx, t_cut in enumerate(cut_times):
-        t_start     = max(0.0, t_cut - overlap_secs)
-        trans_input = idx + 1
-        tr_label    = f"tr{idx}"
-        ov_label    = f"ov{idx}"
+    for t_cut in cut_times:
+        t0 = max(prev_end, t_cut - overlap_secs)
+        t1 = min(base_dur, t0 + trans_dur)
+        if t1 - t0 < ONE_FRAME:
+            continue   # degenerate window — skip
 
-        # Offset the transition so it starts at t_start in the base timeline
-        filter_parts.append(
-            f"[{trans_input}:v]{scale_vf},setpts=PTS+{t_start:.4f}/TB[{tr_label}]"
-        )
-        # Overlay with alpha support; after transition EOF, pass through base
-        filter_parts.append(
-            f"[{prev_label}][{tr_label}]overlay=0:0:format=auto:eof_action=pass[{ov_label}]"
-        )
-        prev_label = ov_label
+        if t0 - prev_end >= ONE_FRAME:
+            segments.append(("plain",   prev_end, t0))
+        segments.append(    ("overlay", t0,       t1))
+        prev_end = t1
 
-    filter_complex = ";".join(filter_parts)
+    # Tail segment after the last transition
+    if base_dur - prev_end >= ONE_FRAME:
+        segments.append(("plain", prev_end, base_dur))
 
-    cmd = input_args + [
+    n_segs     = len(segments)
+    n_overlays = sum(1 for s in segments if s[0] == "overlay")
+
+    # ── 6. Build filter_complex (single FFmpeg pass) ───────────────────────
+    # Inputs: [0] base video,  [1] transition clip
+    fp = []   # filter parts list
+
+    # Split base into one branch per segment
+    base_splits = "".join(f"[b{i}]" for i in range(n_segs))
+    fp.append(f"[0:v]split={n_segs}{base_splits}")
+
+    # Split transition clip into one branch per overlay segment
+    if n_overlays > 0:
+        trans_splits = "".join(f"[t{j}]" for j in range(n_overlays))
+        fp.append(f"[1:v]split={n_overlays}{trans_splits}")
+
+    concat_inputs = []
+    ov_idx = 0
+
+    for i, seg in enumerate(segments):
+        kind, t0, t1 = seg[0], seg[1], seg[2]
+        t0s, t1s = f"{t0:.6f}", f"{t1:.6f}"
+
+        if kind == "plain":
+            fp.append(f"[b{i}]trim={t0s}:{t1s},setpts=PTS-STARTPTS[seg{i}]")
+            concat_inputs.append(f"[seg{i}]")
+        else:
+            # Trim base to the overlay window (only ~1.2 s)
+            fp.append(f"[b{i}]trim={t0s}:{t1s},setpts=PTS-STARTPTS[bw{i}]")
+            # Scale the transition copy to the output resolution
+            fp.append(f"[t{ov_idx}]{scale_vf}[ts{ov_idx}]")
+            # Overlay: alpha channel respected; after clip ends, pass base
+            fp.append(
+                f"[bw{i}][ts{ov_idx}]overlay=0:0:format=auto:eof_action=pass[ov{ov_idx}]"
+            )
+            concat_inputs.append(f"[ov{ov_idx}]")
+            ov_idx += 1
+
+    # Concatenate all segments into the final output
+    concat_str = "".join(concat_inputs)
+    fp.append(f"{concat_str}concat=n={n_segs}:v=1:a=0[out]")
+
+    filter_complex = ";".join(fp)
+
+    # ── 7. Encode (single pass, O(D) work) ────────────────────────────────
+    # Timeout: generous multiplier of real-time; minimum 30 min.
+    timeout_secs = max(1800, int(base_dur * 5))
+
+    cmd = [
+        ffmpeg, "-y",
+        "-i", base,
+        "-i", transition_clip,
         "-filter_complex", filter_complex,
-        "-map",   f"[{prev_label}]",
-        "-c:v",   "libx264",
+        "-map",    "[out]",
+        "-c:v",    "libx264",
+        "-preset", "fast",
         "-pix_fmt", "yuv420p",
         abs_out,
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_secs)
     try:
         os.remove(base)
     except Exception:

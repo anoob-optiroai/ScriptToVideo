@@ -71,7 +71,7 @@ jobs:
   # ── macOS .dmg ───────────────────────────────────────────────────────────────
   build-mac:
     name: macOS DMG
-    runs-on: macos-13   # Intel x64 — macos-latest (arm64) has hdiutil/DMG issues with electron-builder
+    runs-on: macos-12   # Intel x64 — macos-latest (arm64) has hdiutil/DMG issues with electron-builder
 
     steps:
       - name: Checkout
@@ -117,13 +117,13 @@ jobs:
 
       - name: Download FFmpeg (macOS)
         run: |
-          brew install ffmpeg --quiet || true
           mkdir -p ffmpeg_bin
-          BREW_FFMPEG="$(brew --prefix)/bin/ffmpeg"
-          if [ -f "$BREW_FFMPEG" ]; then
-            cp "$BREW_FFMPEG" ffmpeg_bin/ffmpeg
-            chmod +x ffmpeg_bin/ffmpeg
-          fi
+          # Download pre-built static FFmpeg for macOS x64 (fast — no brew compile)
+          curl -L "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip" -o /tmp/ffmpeg_mac.zip
+          unzip -o /tmp/ffmpeg_mac.zip -d /tmp/ffmpeg_mac/
+          cp /tmp/ffmpeg_mac/ffmpeg ffmpeg_bin/ffmpeg
+          chmod +x ffmpeg_bin/ffmpeg
+          ffmpeg_bin/ffmpeg -version | head -1
 
       - name: Build Electron DMG (macOS)
         working-directory: electron
