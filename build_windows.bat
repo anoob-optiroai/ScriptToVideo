@@ -96,21 +96,22 @@ if exist "%FFMPEG_DIR%\ffmpeg.exe" (
     echo Downloading FFmpeg for Windows x64...
     mkdir "%FFMPEG_DIR%" 2>nul
 
-    :: Use PowerShell to download and extract FFmpeg
+    :: Use PowerShell to download and extract FFmpeg + ffprobe
     powershell -Command ^
         "$url = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip';" ^
         "$out = '%TEMP%\ffmpeg_win.zip';" ^
         "Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing;" ^
         "Expand-Archive -Path $out -DestinationPath '%TEMP%\ffmpeg_extract' -Force;" ^
-        "$src = (Get-ChildItem '%TEMP%\ffmpeg_extract' -Recurse -Filter 'ffmpeg.exe' | Select-Object -First 1).FullName;" ^
-        "Copy-Item $src -Destination '%FFMPEG_DIR%\ffmpeg.exe';" ^
+        "$bin = (Get-ChildItem '%TEMP%\ffmpeg_extract' -Recurse -Filter 'ffmpeg.exe' | Select-Object -First 1).DirectoryName;" ^
+        "Copy-Item (Join-Path $bin 'ffmpeg.exe')  -Destination '%FFMPEG_DIR%\ffmpeg.exe';" ^
+        "Copy-Item (Join-Path $bin 'ffprobe.exe') -Destination '%FFMPEG_DIR%\ffprobe.exe';" ^
         "Remove-Item $out -Force;" ^
         "Remove-Item '%TEMP%\ffmpeg_extract' -Recurse -Force"
     if exist "%FFMPEG_DIR%\ffmpeg.exe" (
-        echo [OK] FFmpeg downloaded.
+        echo [OK] FFmpeg + ffprobe downloaded.
     ) else (
         echo [WARN] FFmpeg download failed. The app will try to use a system-installed ffmpeg.
-        echo        Manually place ffmpeg.exe in: %FFMPEG_DIR%
+        echo        Manually place ffmpeg.exe and ffprobe.exe in: %FFMPEG_DIR%
     )
 )
 echo.

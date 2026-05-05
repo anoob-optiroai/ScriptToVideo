@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import {
   Mic, Film, Merge, CheckCircle, Loader, Upload,
   Link, FileText, Download, ChevronRight, AlertCircle, X, Zap, Clock,
-  Play, Pause, Square, Save, FolderOpen, Trash2, Edit2
+  Play, Pause, Square, Save, FolderOpen, Trash2, Edit2, Settings
 } from "lucide-react";
 
 // When served by the packaged backend (port 8765) or the dev backend (port 8000),
@@ -59,6 +59,110 @@ function ProviderBadge({ provider }) {
     <span className={`text-xs px-2 py-0.5 rounded-full border font-medium ${colors[provider] || "bg-slate-700 text-slate-300 border-slate-600"}`}>
       {labels[provider] || provider}
     </span>
+  );
+}
+
+// ── Settings Modal ────────────────────────────────────────────────────────────
+function SettingsModal({ onClose, onSaved }) {
+  const [form, setForm] = useState({ tts_provider: "elevenlabs", elevenlabs_api_key: "", openai_api_key: "", google_cloud_api_key: "", google_docs_api_key: "" });
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [showKeys, setShowKeys] = useState(false);
+
+  useEffect(() => {
+    fetch(`${API_BASE}/api/settings`)
+      .then(r => r.json())
+      .then(d => { setForm(f => ({ ...f, tts_provider: d.tts_provider || "elevenlabs" })); setLoading(false); })
+      .catch(() => setLoading(false));
+  }, []);
+
+  const save = async () => {
+    setSaving(true); setMsg("");
+    const body = { tts_provider: form.tts_provider };
+    if (form.elevenlabs_api_key && !form.elevenlabs_api_key.includes("*")) body.elevenlabs_api_key = form.elevenlabs_api_key;
+    if (form.openai_api_key && !form.openai_api_key.includes("*")) body.openai_api_key = form.openai_api_key;
+    if (form.google_cloud_api_key && !form.google_cloud_api_key.includes("*")) body.google_cloud_api_key = form.google_cloud_api_key;
+    if (form.google_docs_api_key && !form.google_docs_api_key.includes("*")) body.google_docs_api_key = form.google_docs_api_key;
+    try {
+      const r = await fetch(`${API_BASE}/api/settings`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const d = await r.json();
+      setMsg(d.message || "Saved!");
+      if (onSaved) onSaved();
+    } catch { setMsg("Save failed."); }
+    setSaving(false);
+  };
+
+  const Field = ({ label, field, placeholder, hint }) => (
+    <div>
+      <label className="block text-xs text-slate-400 mb-1">{label}</label>
+      <div className="relative">
+        <input type={showKeys ? "text" : "password"} value={form[field]}
+          onChange={e => setForm(f => ({ ...f, [field]: e.target.value }))}
+          placeholder={placeholder}
+          className="w-full bg-slate-700 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-indigo-500 font-mono" />
+      </div>
+      {hint && <p className="text-xs text-slate-500 mt-1">{hint}</p>}
+    </div>
+  );
+
+  return (
+    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+      <div className="bg-slate-800 border border-slate-700 rounded-2xl w-full max-w-md shadow-2xl">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-slate-700">
+          <div className="flex items-center gap-2">
+            <Settings size={16} className="text-indigo-400" />
+            <span className="font-semibold text-slate-100">API Keys &amp; Settings</span>
+          </div>
+          <button onClick={onClose} className="text-slate-400 hover:text-white"><X size={18} /></button>
+        </div>
+
+        {loading ? (
+          <div className="p-8 text-center text-slate-400"><Loader size={20} className="animate-spin mx-auto mb-2" />Loading…</div>
+        ) : (
+          <div className="p-6 space-y-5">
+            {/* TTS Provider */}
+            <div>
+              <label className="block text-xs text-slate-400 mb-2">TTS Provider</label>
+              <div className="flex gap-2">
+                {[["elevenlabs","ElevenLabs"],["openai","OpenAI"],["google","Google"]].map(([v,l]) => (
+                  <button key={v} onClick={() => setForm(f => ({ ...f, tts_provider: v }))}
+                    className={`flex-1 py-2 rounded-lg text-xs font-medium border transition-colors ${form.tts_provider === v ? "bg-indigo-600 border-indigo-500 text-white" : "bg-slate-700 border-slate-600 text-slate-300 hover:border-slate-500"}`}>
+                    {l}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="border-t border-slate-700/60 pt-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-slate-400 font-medium">API Keys</span>
+                <button onClick={() => setShowKeys(v => !v)} className="text-xs text-slate-500 hover:text-slate-300">
+                  {showKeys ? "Hide" : "Show"} keys
+                </button>
+              </div>
+              <Field label="ElevenLabs API Key" field="elevenlabs_api_key" placeholder="sk_..." hint={form.tts_provider === "elevenlabs" ? "Required for current provider" : ""} />
+              <Field label="OpenAI API Key" field="openai_api_key" placeholder="sk-proj-..." hint={form.tts_provider === "openai" ? "Required for current provider" : ""} />
+              <Field label="Google Cloud API Key" field="google_cloud_api_key" placeholder="AIza..." hint={form.tts_provider === "google" ? "Required for current provider" : ""} />
+              <Field label="Google Docs API Key (optional)" field="google_docs_api_key" placeholder="AIza... (for importing Google Docs scripts)" />
+            </div>
+
+            <div className="bg-slate-700/40 rounded-lg px-3 py-2 text-xs text-slate-400">
+              💡 Keys are saved to <code className="text-slate-300">%APPDATA%\ScriptToVideo\.env</code> on your PC only — never shared.
+            </div>
+
+            {msg && <p className={`text-xs text-center ${msg.includes("fail") ? "text-red-400" : "text-green-400"}`}>{msg}</p>}
+
+            <div className="flex gap-2 pt-1">
+              <button onClick={onClose} className="flex-1 py-2 rounded-lg text-sm bg-slate-700 hover:bg-slate-600 text-slate-300">Cancel</button>
+              <button onClick={save} disabled={saving} className="flex-1 py-2 rounded-lg text-sm bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-medium flex items-center justify-center gap-2">
+                {saving ? <><Loader size={14} className="animate-spin" /> Saving…</> : "Save Settings"}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -1584,11 +1688,20 @@ export default function App() {
   const [currentProjectId, setCurrentProjectId] = useState(null);
   const [projectName, setProjectName]     = useState("Untitled Project");
   const [showLoadProject, setShowLoadProject] = useState(false);
+  const [showSettings, setShowSettings]       = useState(false);
   const [saving, setSaving]               = useState(false);
   const [savedMsg, setSavedMsg]           = useState("");
   const [syncDebugInfo, setSyncDebugInfo] = useState(null);
   const [editingProjectName, setEditingProjectName] = useState(false);
   const [projectNameDraft, setProjectNameDraft]     = useState("");
+
+  // Show settings on first launch if no API keys are configured
+  useEffect(() => {
+    fetch(`${API_BASE}/api/settings`)
+      .then(r => r.json())
+      .then(d => { if (!d.is_configured) setShowSettings(true); })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     fetch(`${API_BASE}/api/audio/config`)
@@ -1844,6 +1957,12 @@ export default function App() {
             {saving ? "Saving…" : currentProjectId ? "Save" : "Save Project"}
           </button>
           {savedMsg && <span className="text-xs text-green-400">{savedMsg}</span>}
+          {/* Settings */}
+          <button onClick={() => setShowSettings(true)}
+            title="API Keys & Settings"
+            className="w-8 h-8 flex items-center justify-center rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-400 hover:text-slate-200 transition-colors">
+            <Settings size={15} />
+          </button>
         </div>
       </header>
 
@@ -2034,6 +2153,12 @@ export default function App() {
         <LoadProjectModal
           onClose={() => setShowLoadProject(false)}
           onLoad={handleLoadProject}
+        />
+      )}
+      {showSettings && (
+        <SettingsModal
+          onClose={() => setShowSettings(false)}
+          onSaved={() => setTimeout(() => window.location.reload(), 1200)}
         />
       )}
     </div>
