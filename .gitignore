@@ -1,1 +1,40 @@
-(echo node_modules/&&echo dist_electron/&&echo backend/dist/&&echo frontend/dist/&&echo ffmpeg_bin/&&echo __pycache__/&&echo *.pyc&&echo .env) > .gitignore
+# Dependencies
+node_modules/
+
+# Build outputs
+dist_electron/
+backend/dist/
+frontend/dist/
+frontend/.vite/
+
+# FFmpeg bundled binaries
+ffmpeg_bin/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+backend/routers/__pycache__/
+backend/__pycache__/
+
+# Environment — NEVER commit real API keys
+.env
+backend/.env
+
+# Runtime output directories
+backend/outputs/
+backend/uploads/
+
+# Claude worktrees / session data
+.claude/
+
+# Electron build cache
+electron/node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Quotation drafts
+quotation/

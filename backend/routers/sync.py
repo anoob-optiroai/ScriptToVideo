@@ -32,35 +32,239 @@ def clean_words(text: str) -> list:
     return re.sub(r"[^a-z0-9\s]", "", text.lower()).split()
 
 
+# ── Slide-number marker helpers ───────────────────────────────────────────────
+# When the voice-over script uses "Slide 1", "Slide 2" … as section headers
+# and the narrator reads those numbers aloud, Whisper transcribes them as
+# perfect positional anchors.  We detect them before falling back to title /
+# fuzzy / proportional matching.
+
+_NUM_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+    "nineteen": 19, "twenty": 20,
+    "twentyone": 21, "twentytwo": 22, "twentythree": 23,
+    "twentyfour": 24, "twentyfive": 25, "twentysix": 26,
+    "twentyseven": 27, "twentyeight": 28, "twentynine": 29,
+    "thirty": 30, "thirtyone": 31, "thirtytwo": 32, "thirtythree": 33,
+    "thirtyfour": 34, "thirtyfive": 35, "thirtysix": 36,
+    "thirtyseven": 37, "thirtyeight": 38, "thirtynine": 39,
+    "forty": 40, "fortyone": 41, "fortytwo": 42, "fortythree": 43,
+    "fortyfour": 44, "fortyfive": 45, "fortysix": 46,
+    "fortyseven": 47, "fortyeight": 48, "fortynine": 49,
+    "fifty": 50, "fiftyone": 51, "fiftytwo": 52, "fiftythree": 53,
+    "fiftyfour": 54, "fiftyfive": 55, "fiftysix": 56,
+    "fiftyseven": 57, "fiftyeight": 58, "fiftynine": 59,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+    "hundred": 100,
+}
+
+# Tens words used when combining two-word numbers like "twenty one" → 21.
+# Defined at module level so both _find_all_slide_markers and Pass 0 share it.
+_TENS = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+}
+
+
+def _word_to_int(w: str) -> int:
+    """Convert a digit-string or English number word to int.  Returns -1 if unknown."""
+    if w.isdigit():
+        return int(w)
+    return _NUM_WORDS.get(w.lower(), -1)
+
+
+def _find_all_slide_markers(transcript_words: list, n_slides: int) -> dict:
+    """
+    Robustly find 'slide N' spoken markers in the transcript.
+
+    Two-step approach to avoid false-positive poisoning:
+
+    Step 1 — Collect ALL occurrences of "slide N" (or "slide number N") for
+             every slide number 1..n_slides.  Multiple occurrences per number
+             are kept so we can pick the best one in step 2.
+             Also handles two-word numbers: "slide twenty one" → 21.
+
+    Step 2 — Greedy forward pass: iterate slide numbers in order 1, 2, 3 …
+             and for each one pick the EARLIEST occurrence that appears AFTER
+             the previously accepted marker position.  This means a stray
+             "back on slide 10" mentioned early in the narration does NOT
+             block detection of slides 1-9, because we process them in order.
+
+    Returns {slide_number_1based: word_pos_of_marker}.
+    """
+    total = len(transcript_words)
+
+    # ── Step 1: collect ALL occurrences ──────────────────────────────────────
+    occurrences: dict[int, list[int]] = {}   # num → sorted list of word positions
+
+    for pos in range(total - 1):
+        if transcript_words[pos] != "slide":
+            continue
+        # Try offsets 1 and 2 (to skip optional word "number")
+        for offset in (1, 2):
+            nxt = pos + offset
+            if nxt >= total:
+                break
+            w = transcript_words[nxt]
+            num = _word_to_int(w)
+
+            # Two-word compound: "slide twenty one" → 21
+            # (Whisper usually outputs digits, but word forms happen too)
+            if num < 0 and w in _TENS and nxt + 1 < total:
+                ones = _word_to_int(transcript_words[nxt + 1])
+                if 1 <= ones <= 9:
+                    num = _TENS[w] + ones
+
+            if 1 <= num <= n_slides:
+                occurrences.setdefault(num, []).append(pos)
+                break   # don't try the other offset for this position
+
+    # ── Step 2: greedy forward pass in slide-number order ────────────────────
+    found: dict[int, int] = {}
+    last_pos = -1
+    for num in range(1, n_slides + 1):
+        if num not in occurrences:
+            continue
+        # Pick the earliest occurrence that is strictly after the last accepted pos
+        for pos in sorted(occurrences[num]):
+            if pos > last_pos:
+                found[num] = pos
+                last_pos = pos
+                break
+
+    return found
+
+
+# ── Robust matching helpers ───────────────────────────────────────────────────
+
+# Stop words contribute half-weight in title scoring so one mismatched
+# preposition / article doesn't tank an otherwise good match.
+_TITLE_STOP = {
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "is", "are", "by", "as", "its", "it", "this", "that",
+    "not", "no", "from", "be", "been", "why", "how", "what", "when",
+}
+
+
+def _norm(w: str) -> str:
+    """
+    Light stemming so Whisper inflection variants don't break title matching.
+    Rules (applied in priority order, each only if the remainder is ≥ 3 chars):
+      -ing   → strip  (walking → walk, rolling → roll)
+      -tion  → keep   (protection is its own root)
+      -s     → strip  (risks → risk, matters → matter)  — not -ss / -us / -is
+      -ed    → strip  (prevented → prevent)
+      -ly    → strip  (properly → proper)
+    """
+    if len(w) <= 3:
+        return w
+    if w.endswith("ing") and len(w) > 5:
+        return w[:-3] or w
+    if w.endswith("s") and not w.endswith(("ss", "us", "is", "as")) and len(w) > 3:
+        return w[:-1]
+    if w.endswith("ed") and len(w) > 4:
+        return w[:-2]
+    if w.endswith("ly") and len(w) > 5:
+        return w[:-2]
+    return w
+
+
+def _expand_compound(words: list) -> list:
+    """
+    Split compound words that Whisper may transcribe as two separate words.
+    E.g. "logrolling" → ["log", "rolling"].
+
+    For each word longer than 8 chars, tries all 2-part splits where both
+    parts are ≥ 3 chars; keeps the first valid split found.
+    Returns the expanded list (may be longer than input).
+    """
+    out = []
+    for w in words:
+        if len(w) > 8:
+            split_done = False
+            for k in range(3, len(w) - 2):
+                p1, p2 = w[:k], w[k:]
+                if len(p2) >= 3:
+                    out.extend([p1, p2])
+                    split_done = True
+                    break
+            if not split_done:
+                out.append(w)
+        else:
+            out.append(w)
+    return out
+
+
 # ── Core matching ─────────────────────────────────────────────────────────────
 
 def exact_title_position(title_words: list, transcript_words: list,
                          search_from: int, search_to: int) -> tuple:
     """
-    Search for the slide title as an exact word sequence in the transcript.
-    Slide headings are spoken verbatim, so an exact hit is highly reliable.
+    Search for the slide title as a word-sequence in the transcript.
+
+    Improvements over naive char-exact matching:
+    • Light stemming (_norm) — handles plural-s, -ing, -ed from Whisper
+    • Compound expansion — tries "logrolling" AND "log" + "rolling" (Whisper
+      often splits compound words into two tokens)
+    • Stop-word weighted scoring — prepositions / articles count 0.5× so one
+      mismatched function word doesn't push below the match threshold
+    • Score is always relative to ORIGINAL title word count so it's comparable
+      across both the single-word and split-word forms
 
     Returns (position, score):
-      - score 1.0 = all words match
-      - score 0.7–1.0 = partial match (one word off — Whisper mishear tolerance)
-      - score -1 = no hit found in window
+      score ≥ 0.6  → usable match (threshold previously 0.7)
+      score -1     → no hit found in window
     """
     n = len(title_words)
     if n == 0:
         return -1, 0.0
 
-    search_to = min(search_to, len(transcript_words) - n + 1)
+    # Normalised original title + per-word weights
+    norm_orig   = [_norm(w) for w in title_words]
+    weights_orig = [0.5 if w in _TITLE_STOP else 1.0 for w in title_words]
+    total_orig   = max(sum(weights_orig), 1e-9)
+
+    # Compound-expanded title variant
+    expanded     = _expand_compound(title_words)
+    norm_exp     = [_norm(w) for w in expanded]
+    weights_exp  = [0.5 if w in _TITLE_STOP else 1.0 for w in expanded]
+    # Score the expanded form relative to original n (fair comparison)
+    total_exp_w  = sum(weights_exp)
+
+    search_to = min(search_to, len(transcript_words))
     best_pos, best_score = -1, 0.0
 
     for pos in range(search_from, search_to):
-        window = transcript_words[pos: pos + n]
-        matches = sum(a == b for a, b in zip(title_words, window))
-        score = matches / n
-        if score > best_score:
-            best_score = score
-            best_pos = pos
-        if score == 1.0:
-            break  # perfect match found — stop searching
+        # ── Variant A: original (possibly compound) title words ────────────
+        end_a = pos + len(norm_orig)
+        if end_a <= len(transcript_words):
+            raw_a = sum(
+                w if _norm(transcript_words[pos + j]) == norm_orig[j] else 0.0
+                for j, w in enumerate(weights_orig)
+            )
+            score_a = raw_a / total_orig
+            if score_a > best_score:
+                best_score = score_a
+                best_pos   = pos
+
+        # ── Variant B: expanded (split) title words ────────────────────────
+        if expanded != title_words:
+            end_b = pos + len(norm_exp)
+            if end_b <= len(transcript_words):
+                raw_b = sum(
+                    w if _norm(transcript_words[pos + j]) == norm_exp[j] else 0.0
+                    for j, w in enumerate(weights_exp)
+                )
+                # Normalise by original total so scores are comparable
+                score_b = raw_b / total_orig
+                if score_b > best_score:
+                    best_score = score_b
+                    best_pos   = pos
+
+        if best_score >= 0.99:
+            break
 
     return best_pos, best_score
 
@@ -70,7 +274,7 @@ def fuzzy_match_position(slide_words: list, transcript_words: list,
     """
     Fuzzy match of slide body words as fallback when title match fails.
     """
-    compare_n = min(len(slide_words), 12)
+    compare_n = min(len(slide_words), 24)   # up from 12
     probe     = slide_words[:compare_n]
     total_tw  = len(transcript_words)
     search_to = min(search_to, total_tw - compare_n + 1)
@@ -82,6 +286,47 @@ def fuzzy_match_position(slide_words: list, transcript_words: list,
         if score > best_score:
             best_score = score
             best_pos   = pos
+
+    return best_pos, best_score
+
+
+def _bag_match_position(content_words: list, transcript_words: list,
+                        search_from: int, search_to: int,
+                        window_mult: int = 3) -> tuple:
+    """
+    Bag-of-content-words match: slide through the transcript counting how many
+    key words from the title appear in a window of (n × window_mult) words,
+    in ANY order.
+
+    This catches titles where the narrator says all key words but not in the
+    same contiguous sequence (extra filler words between them, slightly different
+    phrasing, etc.).
+
+    Returns (best_position, fraction_of_content_words_found).
+    """
+    norm_cw = [_norm(w) for w in content_words if len(w) > 2]
+    cw_set  = set(norm_cw)
+    n_cw    = len(cw_set)
+    if n_cw == 0:
+        return -1, 0.0
+
+    win_size  = max(len(content_words) * window_mult, 8)
+    total_tw  = len(transcript_words)
+    search_to = min(search_to, total_tw - win_size + 1)
+
+    best_score, best_pos = -1.0, search_from
+    for pos in range(search_from, max(search_from + 1, search_to)):
+        window_set = {
+            _norm(transcript_words[pos + j])
+            for j in range(min(win_size, total_tw - pos))
+        }
+        matches = sum(1 for w in cw_set if w in window_set)
+        score   = matches / n_cw
+        if score > best_score:
+            best_score = score
+            best_pos   = pos
+        if best_score >= 0.99:
+            break
 
     return best_pos, best_score
 
@@ -100,23 +345,37 @@ def compute_slide_durations(slide_texts: list, segments: list, total_duration: f
       expected_pos  = i/n * total_words          (proportional anchor)
       search window = [max(prev_pos+gap, expected-radius),
                        min(total_words,  expected+radius)]
-      Pass 1 — exact title match  (≥3-word titles only, score ≥ 0.7)
-      Pass 2 — wider title search (2× radius) if pass 1 weak
+      Pass 1 — exact title match  (≥2-word titles, score ≥ 0.6, with stemming+compound)
+      Pass 2 — wider title search (3× radius) if pass 1 weak
       Pass 3 — fuzzy body match   if title still weak
       Pass 4 — proportional fallback
     """
     # ── Build word timeline: [(cleaned_word, timestamp), …] ──────────────────
+    # Prefer per-word timestamps from Whisper (timestamp_granularities=["word"])
+    # — much more accurate than linear interpolation within each segment.
+    # Falls back to linear interpolation if word-level data is unavailable.
     timeline = []
     for seg in segments:
-        raw_words = seg.get("text", "").split()
-        if not raw_words:
-            continue
-        t_start = float(seg.get("start", 0))
-        t_end   = float(seg.get("end", t_start))
-        span    = t_end - t_start
-        for idx, w in enumerate(raw_words):
-            t = t_start + (idx / len(raw_words)) * span
-            timeline.append((re.sub(r"[^a-z0-9]", "", w.lower()), t))
+        word_entries = seg.get("words", [])
+        if word_entries:
+            # Word-level timestamps available — use directly
+            for we in word_entries:
+                raw = we.get("word", "")
+                t   = float(we.get("start", we.get("t", 0)))
+                cleaned = re.sub(r"[^a-z0-9]", "", raw.lower().strip())
+                if cleaned:
+                    timeline.append((cleaned, t))
+        else:
+            # Fallback: linear interpolation within the segment
+            raw_words = seg.get("text", "").split()
+            if not raw_words:
+                continue
+            t_start = float(seg.get("start", 0))
+            t_end   = float(seg.get("end", t_start))
+            span    = t_end - t_start
+            for idx, w in enumerate(raw_words):
+                t = t_start + (idx / len(raw_words)) * span
+                timeline.append((re.sub(r"[^a-z0-9]", "", w.lower()), t))
 
     n = len(slide_texts)
 
@@ -135,28 +394,66 @@ def compute_slide_durations(slide_texts: list, segments: list, total_duration: f
         slide_titles.append("")
     title_word_lists = [clean_words(t) for t in slide_titles]
 
-    # Search radius: ±2× avg_words around the expected position.
-    # This is wide enough to capture slides that run 3–4× longer than average
-    # while still preventing a match from the first/last 10% of the transcript
-    # being assigned to a middle slide.
-    radius = max(avg_words * 2, total_tw // max(n - 1, 1))
+    # ── Debug: pre-scan for "Slide N" markers (logging only) ────────────────
+    # The actual detection now happens inline per-slide in Pass 0 (window-bound).
+    # This pre-scan is kept only for the log line so we can see how many markers
+    # the narrator uses; it is NOT used for positioning decisions.
+    _dbg_markers = _find_all_slide_markers(transcript_words, n)
+    print(f"[sync] slide_num pre-scan: {len(_dbg_markers)}/{n} unique markers found "
+          f"| keys={sorted(_dbg_markers.keys())[:20]}")
+
+    # Search radius: ±2.5× avg_words around the expected position.
+    # Wide enough to capture slides that run 3–4× longer than average.
+    radius = max(int(avg_words * 2.5), total_tw // max(n - 1, 1))
 
     # Minimum word gap to enforce monotonic ordering
-    min_gap = max(1, avg_words // 6)
+    min_gap = max(1, avg_words // 8)
+
+    # ── Confirmed anchors for position interpolation ──────────────────────────
+    # Each entry: (slide_index, word_pos).  Only high-confidence matches are
+    # used as anchors; proportional/fuzzy guesses are NOT added because their
+    # positions can be wrong and would corrupt the interpolation.
+    conf_anchors = [(0, 0)]   # slide 0 always starts at word 0
+
+    def _interp_expected(i: int) -> int:
+        """
+        Interpolate expected word position from the last confirmed anchor to the
+        transcript end.  More accurate than i/n*total_tw when early slides have
+        very different durations than the average.
+        """
+        last_ai, last_ap = conf_anchors[-1]
+        steps_since   = i - last_ai
+        steps_remain  = max(n - last_ai, 1)
+        return int(last_ap + steps_since / steps_remain * (total_tw - last_ap))
 
     # ── Find START word-index for each slide ─────────────────────────────────
-    slide_start_idx = [0]   # slide 0 always starts at word 0
-    slide_match_methods = ["slide0"]  # parallel list for debug output
-    prev_pos = 0
+    slide_start_idx     = [0]         # slide 0 always starts at word 0
+    slide_match_methods = ["slide0"]
+    prev_pos            = 0
+    prev_is_strong      = True        # slide 0 anchor is always correct
 
     for i in range(1, n):
-        # Proportional expected start for this slide
-        expected = int(i / n * total_tw)
+        # ── Compute expected position ───────────────────────────────────────
+        prop_expected  = int(i / n * total_tw)
+        interp_expected = _interp_expected(i)
+        # Use the interpolated estimate when we have a recent anchor (≤ 10 slides
+        # ago); otherwise fall back to proportional to avoid stale anchors.
+        steps_since_anchor = i - conf_anchors[-1][0]
+        expected = interp_expected if steps_since_anchor <= 10 else prop_expected
 
-        # Search window: anchored on expected, but must be after prev_pos+gap
-        win_lo = max(prev_pos + min_gap, expected - radius)
+        # ── Build search window ─────────────────────────────────────────────
+        # When the previous match was weak (proportional/fuzzy), don't let its
+        # possibly-wrong position push win_lo past the actual slide start.
+        # Use the interpolated expected as a softer lower bound in that case.
+        if prev_is_strong:
+            hard_lo = prev_pos + min_gap
+        else:
+            # Previous was uncertain — let the interpolated estimate dominate
+            hard_lo = max(prev_pos + min_gap,
+                          interp_expected - radius)
+
+        win_lo = max(hard_lo, expected - radius)
         win_hi = min(total_tw, expected + radius)
-        # If window collapsed (very short audio or many slides), widen it
         if win_hi - win_lo < avg_words:
             win_hi = min(total_tw, win_lo + avg_words * 2)
 
@@ -164,47 +461,103 @@ def compute_slide_durations(slide_texts: list, segments: list, total_duration: f
         match_method = "proportional"
         title_words = title_word_lists[i]
 
-        # ── Pass 1: exact title match in proportional window ─────────────
-        if len(title_words) >= 2:
-            pos, score = exact_title_position(title_words, transcript_words,
-                                              win_lo, win_hi)
-            if score >= 0.7:
-                match_method = f"title({score:.2f})"
+        # ── Pass 0: spoken "Slide N" marker — inline window search ──────────
+        # Search for "slide N" (or "slide number N") WITHIN the current
+        # proportional window only.  This naturally excludes cross-references
+        # to other slide numbers ("see Slide 10 for details") that appear far
+        # from where slide N should start, which is the critical flaw of any
+        # whole-transcript pre-scan approach.
+        # Also handles two-word numbers: "slide twenty one" → 21.
+        _snum     = i + 1       # 1-based slide number
+        _found_sn = False
+        for _p in range(max(win_lo, prev_pos + 1), min(win_hi, total_tw - 1)):
+            if transcript_words[_p] != "slide":
+                continue
+            for _off in (1, 2):   # "slide N" or "slide number N"
+                _nxt = _p + _off
+                if _nxt >= total_tw:
+                    break
+                _w  = transcript_words[_nxt]
+                _n  = _word_to_int(_w)
+                # Two-word: "slide twenty one" → 21
+                if _n < 0 and _w in _TENS and _nxt + 1 < total_tw:
+                    _ones = _word_to_int(transcript_words[_nxt + 1])
+                    if 1 <= _ones <= 9:
+                        _n = _TENS[_w] + _ones
+                if _n == _snum:
+                    pos          = _p
+                    score        = 1.0
+                    match_method = f"slide_num({_snum})"
+                    _found_sn    = True
+                    break
+            if _found_sn:
+                break
 
-            # ── Pass 2: wider title search (2× radius) ────────────────────
-            if score < 0.7:
-                wide_lo = max(prev_pos + min_gap, expected - radius * 2)
-                wide_hi = min(total_tw, expected + radius * 2)
-                pos2, score2 = exact_title_position(title_words, transcript_words,
-                                                    wide_lo, wide_hi)
-                if score2 > score:
-                    pos, score = pos2, score2
-                if score >= 0.7:
-                    match_method = f"title-wide({score:.2f})"
+        # Passes 1–4 are skipped when Pass 0 (slide_num) already succeeded.
+        if score < 1.0:
 
-        # ── Pass 3: fuzzy body match ──────────────────────────────────────
-        if score < 0.7:
-            body_words = clean_words(slide_texts[i])
-            if body_words:
-                fpos, fscore = fuzzy_match_position(body_words, transcript_words,
-                                                    win_lo, win_hi)
-                if fscore > score:
-                    pos, score = fpos, fscore
-                # Wider fuzzy attempt
-                if score < 0.25:
-                    wide_lo2 = max(prev_pos + min_gap, expected - radius * 2)
-                    wide_hi2 = min(total_tw, expected + radius * 2)
-                    fpos2, fscore2 = fuzzy_match_position(body_words, transcript_words,
-                                                          wide_lo2, wide_hi2)
-                    if fscore2 > score:
-                        pos, score = fpos2, fscore2
-                if score >= 0.35:
-                    match_method = f"fuzzy({score:.2f})"
+            # ── Pass 1: title match in proportional window (score ≥ 0.6) ─────
+            # Uses stemming + compound expansion + stop-word-weighted scoring.
+            # Single-word titles (e.g. "Contraindications") are included since
+            # they can be highly distinctive medical/technical terms.
+            if len(title_words) >= 1:
+                pos, score = exact_title_position(title_words, transcript_words,
+                                                  win_lo, win_hi)
+                if score >= 0.6:
+                    match_method = f"title({score:.2f})"
 
-        # ── Pass 4: proportional fallback ─────────────────────────────────
-        if pos < 0 or score < 0.35:
-            pos = expected
-            match_method = "proportional"
+                # ── Pass 2: wider title search (4× radius) ────────────────────
+                if score < 0.6:
+                    wide_lo = max(prev_pos + min_gap, expected - radius * 4)
+                    wide_hi = min(total_tw, expected + radius * 4)
+                    pos2, score2 = exact_title_position(title_words, transcript_words,
+                                                        wide_lo, wide_hi)
+                    if score2 > score:
+                        pos, score = pos2, score2
+                    if score >= 0.6:
+                        match_method = f"title-wide({score:.2f})"
+
+            # ── Pass 2.5: content-word bag match (unordered, wider window) ────
+            # Catches titles where the narrator says all key words but not in the
+            # exact same order (e.g. "the log rolling procedure and clinical…").
+            if score < 0.6 and len(title_words) >= 1:
+                bag_words = [w for w in title_words
+                             if w not in _TITLE_STOP and len(w) > 2]
+                if len(bag_words) >= 1:
+                    bpos, bscore = _bag_match_position(
+                        bag_words, transcript_words,
+                        max(prev_pos + min_gap, expected - radius * 4),
+                        min(total_tw, expected + radius * 4),
+                    )
+                    if bscore > score:
+                        pos, score = bpos, bscore
+                        if bscore >= 0.6:
+                            match_method = f"bag({bscore:.2f})"
+
+            # ── Pass 3: fuzzy body match ──────────────────────────────────────
+            if score < 0.6:
+                # Combine title + body for richer text fingerprint
+                body_raw   = clean_words(slide_texts[i])
+                combined   = (title_words + body_raw)[:24]   # up from 12
+                if combined:
+                    fpos, fscore = fuzzy_match_position(combined, transcript_words,
+                                                        win_lo, win_hi)
+                    if fscore > score:
+                        pos, score = fpos, fscore
+                    if score < 0.30:
+                        wide_lo3 = max(prev_pos + min_gap, expected - radius * 4)
+                        wide_hi3 = min(total_tw, expected + radius * 4)
+                        fpos2, fscore2 = fuzzy_match_position(combined, transcript_words,
+                                                              wide_lo3, wide_hi3)
+                        if fscore2 > score:
+                            pos, score = fpos2, fscore2
+                    if score >= 0.35:
+                        match_method = f"fuzzy({score:.2f})"
+
+            # ── Pass 4: proportional fallback ─────────────────────────────────
+            if pos < 0 or score < 0.35:
+                pos = expected
+                match_method = "proportional"
 
         # Enforce monotonic: pos must be strictly after prev_pos
         pos = max(pos, prev_pos + min_gap)
@@ -213,6 +566,17 @@ def compute_slide_durations(slide_texts: list, segments: list, total_duration: f
         slide_start_idx.append(pos)
         slide_match_methods.append(match_method)
         prev_pos = pos
+
+        # Update anchors and strong-prev flag
+        # slide_num matches are always perfect anchors; high-confidence title
+        # matches (≥ 0.65) also qualify.
+        is_strong = (
+            match_method.startswith("slide_num") or
+            (match_method.startswith("title") and _match_score(match_method) >= 0.65)
+        )
+        if is_strong:
+            conf_anchors.append((i, pos))
+        prev_is_strong = is_strong
 
     # ── Convert start-indices to durations ────────────────────────────────────
     durations = []
@@ -254,7 +618,7 @@ def compute_slide_durations(slide_texts: list, segments: list, total_duration: f
         avg_dur = total_duration / n
         strong_matches = {
             i for i, m in enumerate(slide_match_methods)
-            if m.startswith("title") and _match_score(m) >= 0.85
+            if m.startswith("title") and _match_score(m) >= 0.75
         }
         cap_dur   = avg_dur * 2.0
         floor_dur = max(10.0, avg_dur * 0.25)
@@ -439,6 +803,7 @@ def run_sync_analysis(job_id: str, audio_filename: str, frames_job_id: str):
                 model="whisper-1",
                 file=f,
                 response_format="verbose_json",
+                timestamp_granularities=["word", "segment"],
             )
 
         if tmp:
@@ -455,7 +820,16 @@ def run_sync_analysis(job_id: str, audio_filename: str, frames_job_id: str):
             if isinstance(s, dict):
                 seg_dicts.append(s)
             else:
-                seg_dicts.append({"text": s.text, "start": s.start, "end": s.end})
+                d = {"text": s.text, "start": s.start, "end": s.end}
+                # Carry word-level timestamps through if Whisper returned them
+                words = getattr(s, "words", None)
+                if words:
+                    d["words"] = [
+                        {"word": w.word, "start": w.start, "end": w.end}
+                        if not isinstance(w, dict) else w
+                        for w in words
+                    ]
+                seg_dicts.append(d)
 
         total_duration = float(
             getattr(transcript, "duration", None) or
@@ -491,9 +865,13 @@ def run_sync_analysis(job_id: str, audio_filename: str, frames_job_id: str):
                 timing_path = frames_dir / "element_timing.json"
                 with open(timing_path, "w", encoding="utf-8") as f:
                     json.dump(element_timing, f, ensure_ascii=False)
+                print(f"[sync] element_timing written: {len(element_timing)} slides, "
+                      f"element counts: {[len(s) for s in element_timing[:8]]}{'...' if len(element_timing) > 8 else ''}")
         except Exception as _et_err:
             # Non-fatal — animation will fall back to uniform timing
+            import traceback as _et_tb
             print(f"[sync] element_timing skipped: {_et_err}")
+            _et_tb.print_exc()
 
         job.update(
             status="done",

@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import {
   Mic, Film, Merge, CheckCircle, Loader, Upload,
   Link, FileText, Download, ChevronRight, AlertCircle, X, Zap, Clock,
-  Play, Pause, Square
+  Play, Pause, Square, Save, FolderOpen, Trash2, Edit2
 } from "lucide-react";
 
 const API_BASE = "http://localhost:8000";
@@ -427,37 +427,59 @@ function AudioRegionLightbox({ audioUrl, totalDuration, slideIndex, slideTitle, 
   // ── Fetch blob + decode waveform ──────────────────────────────────────────
   useEffect(() => {
     let blobUrl = null;
+    let cancelled = false;
     setAudioReady("loading");
     setPeaks(null);
+
     fetch(audioUrl)
       .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.blob(); })
       .then(async blob => {
+        if (cancelled) return;
         blobUrl = URL.createObjectURL(blob);
         blobUrlRef.current = blobUrl;
         const a = audioRef.current;
         if (a) {
           a.src = blobUrl;
-          a.addEventListener("loadedmetadata", () => setAudioReady("ready"), { once: true });
+          a.addEventListener("loadedmetadata", () => {
+            if (!cancelled) setAudioReady("ready");
+          }, { once: true });
           a.load();
         }
-        // Decode for waveform (separate arraybuffer from the same blob)
-        const buf = await blob.arrayBuffer();
-        const ac  = new AudioContext();
-        const decoded = await ac.decodeAudioData(buf);
-        const data  = decoded.getChannelData(0);
-        const N     = 3000;
-        const block = Math.floor(data.length / N);
-        const arr   = new Float32Array(N);
-        for (let i = 0; i < N; i++) {
-          let mx = 0;
-          for (let j = 0; j < block; j++) mx = Math.max(mx, Math.abs(data[i * block + j]));
-          arr[i] = mx;
+
+        // Decode waveform peaks — runs INDEPENDENTLY so any error here
+        // does NOT set audioReady to "error" (buttons stay usable).
+        // For long files (10+ min) decodeAudioData can take several seconds;
+        // without this isolation it was disabling play/stop mid-playback.
+        let ac = null;
+        try {
+          const buf = await blob.arrayBuffer();
+          if (cancelled) return;
+          ac = new AudioContext();
+          const decoded = await ac.decodeAudioData(buf);
+          if (cancelled) return;
+          const data  = decoded.getChannelData(0);
+          const N     = 3000;
+          const block = Math.floor(data.length / N);
+          const arr   = new Float32Array(N);
+          for (let i = 0; i < N; i++) {
+            let mx = 0;
+            for (let j = 0; j < block; j++) mx = Math.max(mx, Math.abs(data[i * block + j]));
+            arr[i] = mx;
+          }
+          if (!cancelled) setPeaks(arr);
+        } catch (waveErr) {
+          console.warn("[waveform] decode failed (audio still usable):", waveErr);
+        } finally {
+          try { await ac?.close(); } catch (_) {}
         }
-        setPeaks(arr);
-        await ac.close();
       })
-      .catch(() => setAudioReady("error"));
-    return () => { if (blobUrl) URL.revokeObjectURL(blobUrl); blobUrlRef.current = null; };
+      .catch(() => { if (!cancelled) setAudioReady("error"); });
+
+    return () => {
+      cancelled = true;
+      if (blobUrl) URL.revokeObjectURL(blobUrl);
+      blobUrlRef.current = null;
+    };
   }, [audioUrl]);
 
   // ── Draw waveform canvas ──────────────────────────────────────────────────
@@ -545,7 +567,7 @@ function AudioRegionLightbox({ audioUrl, totalDuration, slideIndex, slideTitle, 
   // ── rAF tick with auto-follow ─────────────────────────────────────────────
   const tick = useCallback(() => {
     const a = audioRef.current;
-    if (!a) return;
+    if (!a || a.paused) return;   // guard: stop scheduling if audio was paused externally
     const t = a.currentTime;
     setPlayhead(t);
     playheadRef.current = t;
@@ -947,13 +969,71 @@ function AudioRegionLightbox({ audioUrl, totalDuration, slideIndex, slideTitle, 
   );
 }
 
+// ── Helper: AI sync debug info → video-timeline slide durations ───────────────
+// AI sync stores duration_sec as gap between consecutive *spoken* markers.
+// Example: slide 1 spoken marker at 14 s, slide 2 at 51 s → duration_sec[0]=37 s.
+// But in the video slide 1 plays from t=0, so its correct video duration = 51 s.
+//
+// sync.py pads the LAST slide so sum(duration_sec) = T (total audio duration).
+// That padding can include both a preamble AND cap-transfer amounts from other
+// slides.  Subtracting only the preamble leaves cap-transfer excess, making the
+// video longer than the audio (transition drift at end).
+//
+// Correct formula:
+//   slide 0   → starts[1]               (covers the preamble + narration up to slide 2)
+//   slide i   → duration_sec[i]         (gap between markers, no change needed)
+//   last slide → T - starts[n-1]        (narration from last marker to end of audio)
+//
+//   sum = starts[1] + Σ(starts[i+1]-starts[i], i=1..n-2) + (T - starts[n-1]) = T ✓
+function toVideoDurations(debugInfo) {
+  if (!debugInfo?.length) return null;
+  const n = debugInfo.length;
+  const starts = debugInfo.map(d => parseFloat(d.start_sec) || 0);
+  // Total audio duration = sum of all duration_sec (sync.py guarantees this = audio length)
+  const totalDur = debugInfo.reduce((s, d) => s + (parseFloat(d.duration_sec) || 0), 0);
+
+  return debugInfo.map((d, i) => {
+    if (i === 0 && n > 1) {
+      // Slide 1: video plays from t=0 to when the narrator reaches slide 2.
+      // This absorbs any preamble silence before "Slide 1" is spoken.
+      return Math.max(0.1, starts[1]);
+    }
+    if (i < n - 1) {
+      // Middle slides: use the ACTUAL audio gap between consecutive markers.
+      // Using duration_sec here would drift if sync.py's cap-transfer mechanism
+      // inflated/deflated durations for weak-match slides.
+      // starts[i+1] - starts[i] is always the ground-truth narration window.
+      return Math.max(0.1, starts[i + 1] - starts[i]);
+    }
+    // Last slide: from its audio marker to the very end of the audio track.
+    // totalDur - starts[n-1] removes ALL sync.py padding (preamble gap +
+    // any cap-transfer excess) so sum(toVideoDurations) == totalDur exactly.
+    return Math.max(0.1, totalDur - starts[n - 1]);
+  });
+}
+
 // ── AI Sync Button ────────────────────────────────────────────────────────────
-function AiSyncButton({ audioResult, slidesResult, onSynced }) {
+function AiSyncButton({ audioResult, slidesResult, onSynced, onDebugInfo, onSyncComplete, initialDebugInfo }) {
   const [syncStatus, setSyncStatus] = useState("idle"); // idle | running | done | error
   const [progress, setProgress] = useState(0);
   const [message, setMessage] = useState("");
-  const [debugInfo, setDebugInfo] = useState(null);
+  const [debugInfo, setDebugInfo] = useState(initialDebugInfo || null);
   const [showDebug, setShowDebug] = useState(false);
+
+  // When a saved project is loaded the parent passes a new initialDebugInfo prop.
+  // useState only uses the initial value at mount, so we need this effect to
+  // update local state whenever the prop changes (e.g. after loadProject()).
+  // We also flip syncStatus to "done" so the debug table becomes visible —
+  // without this the table is hidden behind the syncStatus === "done" gate
+  // and the user thinks their saved sync data is gone.
+  useEffect(() => {
+    if (initialDebugInfo && initialDebugInfo.length > 0) {
+      setDebugInfo(initialDebugInfo);
+      setSyncStatus("done");
+      setMessage(`Loaded ${initialDebugInfo.length} slides — view or edit timing below`);
+      setShowDebug(false); // keep collapsed; user can click "Show sync debug table"
+    }
+  }, [initialDebugInfo]);
   const [refreshStatus, setRefreshStatus] = useState("idle"); // idle | running | done | error
   const [refreshMsg, setRefreshMsg] = useState("");
   const [refreshCount, setRefreshCount] = useState(null);   // titles_extracted after refresh
@@ -1002,7 +1082,9 @@ function AiSyncButton({ audioResult, slidesResult, onSynced }) {
     }
 
     setDebugInfo(updated);
-    onSynced(updated.map(d => d.duration_sec));
+    onDebugInfo?.(updated);
+    // Use corrected video durations (slide 0 plays from t=0, not its start_sec)
+    onSynced(toVideoDurations(updated) ?? updated.map(d => d.duration_sec));
     setEditingRow(null);
   };
 
@@ -1072,8 +1154,16 @@ function AiSyncButton({ audioResult, slidesResult, onSynced }) {
 
       setMessage(`Synced ${result.slide_count} slides — ${result.total_duration.toFixed(1)}s total`);
       setSyncStatus("done");
-      if (result.debug) setDebugInfo(result.debug);
-      onSynced(result.slide_durations);
+      if (result.debug) {
+        setDebugInfo(result.debug);
+        onDebugInfo?.(result.debug);
+      }
+      // Convert audio-gap durations → correct video-timeline durations.
+      // (Slide 1 plays from t=0 in the video, not from when "Slide 1" is spoken.)
+      const videoDurs = toVideoDurations(result.debug) ?? result.slide_durations;
+      onSynced(videoDurs);
+      // Notify parent with fresh data so it can auto-save without stale-closure issues
+      onSyncComplete?.(result.debug ?? null, videoDurs);
     } catch (e) {
       setMessage(e.message);
       setSyncStatus("error");
@@ -1386,6 +1476,90 @@ function UploadVideoButton({ onDone }) {
   );
 }
 
+// ── Load Project Modal ────────────────────────────────────────────────────────
+function LoadProjectModal({ onClose, onLoad }) {
+  const [projects, setProjects] = useState([]);
+  const [loading, setLoading]   = useState(true);
+  const [error, setError]       = useState("");
+  const [deleting, setDeleting] = useState(null);
+
+  useEffect(() => {
+    fetch(`${API_BASE}/api/project/list`)
+      .then(r => r.json())
+      .then(d => { setProjects(d.projects || []); setLoading(false); })
+      .catch(() => { setError("Could not load projects."); setLoading(false); });
+  }, []);
+
+  const fmtDate = iso => {
+    try { return new Date(iso).toLocaleString(); } catch { return iso; }
+  };
+
+  const handleDelete = async (pid) => {
+    setDeleting(pid);
+    await fetch(`${API_BASE}/api/project/delete/${pid}`, { method: "DELETE" }).catch(() => {});
+    setProjects(p => p.filter(x => x.project_id !== pid));
+    setDeleting(null);
+  };
+
+  const handleLoad = async (pid) => {
+    try {
+      const r = await fetch(`${API_BASE}/api/project/load/${pid}`);
+      if (!r.ok) throw new Error("Not found");
+      const data = await r.json();
+      onLoad(data);
+      onClose();
+    } catch (e) {
+      setError("Failed to load project: " + e.message);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+      <div className="bg-slate-800 rounded-2xl w-full max-w-lg shadow-2xl border border-slate-700">
+        <div className="flex items-center justify-between p-5 border-b border-slate-700">
+          <div className="flex items-center gap-2">
+            <FolderOpen size={20} className="text-indigo-400" />
+            <span className="font-semibold text-lg">Load Project</span>
+          </div>
+          <button onClick={onClose} className="text-slate-400 hover:text-white"><X size={20} /></button>
+        </div>
+        <div className="p-5 max-h-96 overflow-y-auto">
+          {loading && <p className="text-slate-400 text-sm text-center py-4">Loading…</p>}
+          {error   && <p className="text-red-400 text-sm">{error}</p>}
+          {!loading && projects.length === 0 && (
+            <p className="text-slate-400 text-sm text-center py-4">No saved projects yet.</p>
+          )}
+          <div className="space-y-2">
+            {projects.map(p => (
+              <div key={p.project_id}
+                className="flex items-center gap-3 bg-slate-700/50 border border-slate-600 rounded-xl px-4 py-3">
+                <div className="flex-1 min-w-0">
+                  <p className="font-medium text-sm text-slate-100 truncate">{p.project_name}</p>
+                  <p className="text-xs text-slate-400">
+                    {p.slide_count ? `${p.slide_count} slides` : "—"}{" "}
+                    · {fmtDate(p.saved_at)}
+                  </p>
+                </div>
+                <button onClick={() => handleLoad(p.project_id)}
+                  className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs font-medium whitespace-nowrap">
+                  Load
+                </button>
+                <button onClick={() => handleDelete(p.project_id)} disabled={deleting === p.project_id}
+                  className="p-1.5 text-slate-500 hover:text-red-400 transition-colors disabled:opacity-40">
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="p-4 border-t border-slate-700 flex justify-end">
+          <button onClick={onClose} className="px-4 py-2 text-sm text-slate-400 hover:text-white">Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Main App ──────────────────────────────────────────────────────────────────
 export default function App() {
   const [showAudio, setShowAudio] = useState(false);
@@ -1401,6 +1575,15 @@ export default function App() {
   const [providerInfo, setProviderInfo] = useState(null);
   const [slideTimes, setSlideTimes] = useState([]);
   const [thumbnails, setThumbnails] = useState([]);
+  // Project save / load
+  const [currentProjectId, setCurrentProjectId] = useState(null);
+  const [projectName, setProjectName]     = useState("Untitled Project");
+  const [showLoadProject, setShowLoadProject] = useState(false);
+  const [saving, setSaving]               = useState(false);
+  const [savedMsg, setSavedMsg]           = useState("");
+  const [syncDebugInfo, setSyncDebugInfo] = useState(null);
+  const [editingProjectName, setEditingProjectName] = useState(false);
+  const [projectNameDraft, setProjectNameDraft]     = useState("");
 
   useEffect(() => {
     fetch(`${API_BASE}/api/audio/config`)
@@ -1409,7 +1592,11 @@ export default function App() {
       .catch(() => {});
   }, []);
 
-  // Load thumbnails when slides result changes
+  // Load thumbnails when slides result changes.
+  // IMPORTANT: only reset slideTimes to defaults when the frame count actually
+  // changes (new PPTX uploaded).  If we already hold the right number of
+  // entries — from a project load, AI sync, or manual edits — keep them so
+  // we don't silently wipe custom timing every time slidesResult updates.
   useEffect(() => {
     if (slidesResult?.frames_job_id) {
       fetch(`${API_BASE}/api/slides/frames/${slidesResult.frames_job_id}`)
@@ -1417,14 +1604,18 @@ export default function App() {
         .then(data => {
           const frames = data.frames || [];
           setThumbnails(frames);
-          // Initialise per-slide times (default 5s each)
-          setSlideTimes(Array(frames.length).fill(5));
+          // Use functional updater: preserve existing times if count matches.
+          setSlideTimes(prev =>
+            prev.length === frames.length ? prev : Array(frames.length).fill(5)
+          );
         })
         .catch(() => {
           // Fallback: create placeholders from slide_count
           const n = slidesResult.slide_count || 0;
           setThumbnails([]);
-          setSlideTimes(Array(n).fill(5));
+          setSlideTimes(prev =>
+            prev.length === n ? prev : Array(n).fill(5)
+          );
         });
     }
   }, [slidesResult]);
@@ -1449,7 +1640,39 @@ export default function App() {
         body.transition_clip_id  = slidesResult.transition_clip_id  || null;
       }
       if (mode === "per_slide") {
-        body.slide_durations = slideTimes.map(t => parseFloat(t) || 1);
+        // Source of truth priority:
+        // 1. slideTimes  — the "Set duration per slide" panel values.
+        //    These are populated by AI sync (via onSynced) AND updated by
+        //    manual edits.  Using slideTimes as primary means the user can
+        //    always override individual slides by typing in the panel.
+        // 2. toVideoDurations(syncDebugInfo) — computed from the AI sync
+        //    debug table.  Used only as a fallback when slideTimes are
+        //    clearly invalid (all zeros / 1-second defaults).
+        const panelDurations = slideTimes.map(t => parseFloat(t) || 0);
+        const debugDurations = toVideoDurations(syncDebugInfo);
+
+        // Treat slideTimes as valid when at least half the values are > 2 s
+        // (rules out the "frames useEffect reset everything to 5 s default" case
+        //  and also handles partly-filled states gracefully).
+        const validSlideCount = panelDurations.filter(d => d > 2).length;
+        const panelIsValid = validSlideCount >= panelDurations.length / 2;
+
+        let source;
+        if (panelIsValid && panelDurations.length > 0) {
+          body.slide_durations = panelDurations;
+          source = "panel (user edits / AI-sync)";
+        } else if (debugDurations && debugDurations.length > 0) {
+          body.slide_durations = debugDurations;
+          source = "AI-sync debug fallback";
+        } else {
+          body.slide_durations = panelDurations;
+          source = "panel (fallback — no debug info)";
+        }
+
+        const totalSent = body.slide_durations.reduce((s, d) => s + d, 0);
+        console.log(`[merge] slide_durations source: ${source} | ` +
+          `count=${body.slide_durations.length} | total=${totalSent.toFixed(1)}s | ` +
+          `first5=[${body.slide_durations.slice(0,5).map(d=>d.toFixed(2)).join(', ')}]`);
       }
 
       const r = await fetch(`${API_BASE}/api/merge/combine`, {
@@ -1475,6 +1698,83 @@ export default function App() {
     setSlideTimes([]); setThumbnails([]);
   };
 
+  // ── Project save / load ─────────────────────────────────────────────────────
+  const buildProjectState = () => ({
+    project_name:  projectName,
+    audio_result:  audioResult,
+    slides_result: slidesResult,
+    slide_times:   slideTimes,
+    sync_mode:     syncMode,
+    debug_info:    syncDebugInfo,
+  });
+
+  // overrides: optional partial state to merge into the saved body.
+  // Used by auto-save after AI sync to pass fresh data that hasn't yet
+  // propagated through React's async state updates.
+  const handleSave = async (overrides) => {
+    // Guard: only accept a plain object as overrides (never a DOM Event etc.)
+    const safeOverrides = (overrides && overrides.constructor === Object) ? overrides : {};
+    setSaving(true); setSavedMsg("");
+    try {
+      const body = { ...buildProjectState(), ...safeOverrides };
+      let r;
+      if (currentProjectId) {
+        r = await fetch(`${API_BASE}/api/project/save/${currentProjectId}`,
+          { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      } else {
+        r = await fetch(`${API_BASE}/api/project/save`,
+          { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      }
+      if (!r.ok) throw new Error(await r.text());
+      const data = await r.json();
+      setCurrentProjectId(data.project_id);
+      setSavedMsg("Saved ✓");
+      setTimeout(() => setSavedMsg(""), 3000);
+    } catch (e) {
+      setSavedMsg("Save failed: " + e.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // Auto-save immediately after AI sync completes.
+  // The fresh debugInfo and durations are passed directly to avoid
+  // reading stale React state (setSyncDebugInfo is async and may not
+  // have committed by the time handleSave reads syncDebugInfo).
+  const handleAutoSaveAfterSync = (debugInfo, durations) => {
+    handleSave({
+      debug_info:  debugInfo,
+      slide_times: durations,
+      sync_mode:   "per_slide",
+    });
+  };
+
+  const handleLoadProject = (data) => {
+    if (data.audio_result)  setAudioResult(data.audio_result);
+    if (data.sync_mode)     setSyncMode(data.sync_mode);
+    if (data.debug_info)    setSyncDebugInfo(data.debug_info);
+    if (data.project_name)  setProjectName(data.project_name);
+    if (data.project_id)    setCurrentProjectId(data.project_id);
+    setFinalResult(null);
+    setMergeError("");
+
+    // Restore slide timings as corrected video-timeline durations.
+    // Always prefer re-computing from debug_info (has start_sec for the
+    // video-start correction) over the raw slide_times that were saved with
+    // the old duration_sec values.  Fall back to slide_times only if there
+    // is no debug_info (e.g. manually-timed project with no AI sync).
+    // Set BEFORE slidesResult so the frames-fetch useEffect sees the correct
+    // count and its functional updater preserves them instead of resetting to 5 s.
+    const restoredTimes =
+      data.debug_info?.length  ? toVideoDurations(data.debug_info) :
+      data.slide_times?.length ? data.slide_times :
+      null;
+    if (restoredTimes) setSlideTimes(restoredTimes);
+
+    // Set slidesResult last — triggers the frames-fetch useEffect.
+    if (data.slides_result) setSlidesResult(data.slides_result);
+  };
+
   const steps = [
     { label: "Script → Audio", done: !!audioResult,  active: !audioResult },
     { label: "Slides → Video", done: !!slidesResult, active: !slidesResult },
@@ -1496,14 +1796,49 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900">
-      <header className="border-b border-slate-700/50 px-6 py-4 flex items-center justify-between">
-        <div className="flex items-center gap-3">
+      <header className="border-b border-slate-700/50 px-6 py-3 flex items-center justify-between gap-4">
+        <div className="flex items-center gap-3 shrink-0">
           <div className="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center"><Film size={18} /></div>
-          <span className="font-bold text-xl tracking-tight">ScriptToVideo</span>
+          <div className="flex flex-col leading-tight">
+            <span className="font-bold text-xl tracking-tight">ScriptToVideo</span>
+            <span className="text-xs text-slate-400 tracking-wide">by Anoob C</span>
+          </div>
         </div>
-        <div className="flex items-center gap-3">
+
+        {/* Project name (editable) */}
+        <div className="flex-1 flex items-center justify-center min-w-0">
+          {editingProjectName ? (
+            <input autoFocus value={projectNameDraft}
+              onChange={e => setProjectNameDraft(e.target.value)}
+              onBlur={() => { setProjectName(projectNameDraft || "Untitled Project"); setEditingProjectName(false); }}
+              onKeyDown={e => { if (e.key === "Enter") { setProjectName(projectNameDraft || "Untitled Project"); setEditingProjectName(false); } }}
+              className="text-sm font-medium bg-slate-700 border border-indigo-500 rounded-lg px-3 py-1 text-slate-100 focus:outline-none w-64" />
+          ) : (
+            <button onClick={() => { setProjectNameDraft(projectName); setEditingProjectName(true); }}
+              className="flex items-center gap-1.5 text-sm text-slate-300 hover:text-white group">
+              <span className="font-medium truncate max-w-xs">{projectName}</span>
+              <Edit2 size={12} className="text-slate-500 group-hover:text-slate-300 shrink-0" />
+            </button>
+          )}
+          {currentProjectId && (
+            <span className="ml-2 text-xs text-slate-600 hidden sm:inline">#{currentProjectId}</span>
+          )}
+        </div>
+
+        <div className="flex items-center gap-2 shrink-0">
           {providerInfo && <ProviderBadge provider={providerInfo.provider} />}
-          <span className="text-xs text-slate-500 bg-slate-800 px-3 py-1 rounded-full border border-slate-700">Local — v1.1</span>
+          {/* Load project */}
+          <button onClick={() => setShowLoadProject(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-700 hover:bg-slate-600 text-slate-300 transition-colors">
+            <FolderOpen size={13} /> Load
+          </button>
+          {/* Save project */}
+          <button onClick={() => handleSave()} disabled={saving || (!audioResult && !slidesResult)}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white transition-colors">
+            {saving ? <Loader size={12} className="animate-spin" /> : <Save size={13} />}
+            {saving ? "Saving…" : currentProjectId ? "Save" : "Save Project"}
+          </button>
+          {savedMsg && <span className="text-xs text-green-400">{savedMsg}</span>}
         </div>
       </header>
 
@@ -1635,6 +1970,9 @@ export default function App() {
                     <AiSyncButton
                       audioResult={audioResult}
                       slidesResult={slidesResult}
+                      initialDebugInfo={syncDebugInfo}
+                      onDebugInfo={setSyncDebugInfo}
+                      onSyncComplete={handleAutoSaveAfterSync}
                       onSynced={(durations) => {
                         setSlideTimes(durations);
                         setSyncMode("per_slide");
@@ -1687,6 +2025,12 @@ export default function App() {
 
       {showAudio && <AudioModal onClose={() => setShowAudio(false)} onDone={r => setAudioResult(r)} />}
       {showSlides && <SlidesModal onClose={() => setShowSlides(false)} onDone={r => setSlidesResult(r)} />}
+      {showLoadProject && (
+        <LoadProjectModal
+          onClose={() => setShowLoadProject(false)}
+          onLoad={handleLoadProject}
+        />
+      )}
     </div>
   );
 }

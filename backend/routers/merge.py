@@ -122,6 +122,10 @@ def run_merge(
                         f"slide_durations must have at least {len(frame_files)} entries."
                     )
                 durations = slide_durations[: len(frame_files)]
+                total_dur = sum(durations)
+                print(f"[merge] per_slide: {len(durations)} slides, "
+                      f"total={total_dur:.1f}s, "
+                      f"first 5 durations: {[round(d,2) for d in durations[:5]]}")
 
             # Resolve PPTX and transition clip (kept in frames dir / transitions dir)
             pptx_copy  = str(frames_dir / "source.pptx")
@@ -132,18 +136,12 @@ def run_merge(
                 if os.path.exists(c):
                     trans_clip = c
 
-            # Load voiceover-synced element delays if available (written by sync worker)
+            # Voiceover keyword-sync was removed — narration text rarely matches slide
+            # text verbatim, causing all elements to clamp to the slide end.
+            # Uniform proportional spacing (handled inside build_video_from_images)
+            # is more reliable and always produces correct progressive reveals.
             element_timing = None
-            _timing_path = frames_dir / "element_timing.json"
-            if _timing_path.exists() and animation in (
-                "text_fade", "text_slide_up", "text_wipe", "char_overshoot_scale"
-            ):
-                try:
-                    import json as _json
-                    with open(_timing_path, "r", encoding="utf-8") as _tf:
-                        element_timing = _json.load(_tf)
-                except Exception as _et_err:
-                    print(f"[merge] element_timing load failed: {_et_err}")
+            print(f"[merge] element_timing disabled — using uniform proportional animation")
 
             job.update(progress=30, message="Rebuilding video with custom slide timing...")
             rebuilt_path = str(Path(settings.video_output_dir) / f"{job_id}_rebuilt.mp4")
@@ -170,7 +168,56 @@ def run_merge(
             )
             video_path = rebuilt_path
 
-            # Durations now match — simple mux (no padding/looping needed)
+            # ── Trim / pad rebuilt video to exactly match audio duration ─────
+            # A small mismatch (> 50 ms) can cause mux issues or A/V drift.
+            try:
+                _vid_dur   = get_media_duration(rebuilt_path)
+                _aud_dur   = get_media_duration(audio_path)
+                _mismatch  = _vid_dur - _aud_dur
+                print(f"[merge] Duration check — video: {_vid_dur:.1f}s, "
+                      f"audio: {_aud_dur:.1f}s, "
+                      f"difference: {_mismatch:+.1f}s  "
+                      f"({'trimming video' if _mismatch > 0.05 else 'padding video' if _mismatch < -0.05 else 'OK — durations match'})")
+                if abs(_mismatch) > 0.05:
+                    _fixed_path = str(Path(settings.video_output_dir) / f"{job_id}_fixed.mp4")
+                    if _mismatch > 0:
+                        # Video is longer — trim to audio duration
+                        _fix_cmd = [
+                            settings.ffmpeg_binary, "-y",
+                            "-i", rebuilt_path,
+                            "-t", str(_aud_dur),
+                            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                            _fixed_path,
+                        ]
+                    else:
+                        # Video is shorter — pad last frame to match audio duration
+                        _pad_secs = _aud_dur - _vid_dur
+                        _fix_cmd = [
+                            settings.ffmpeg_binary, "-y",
+                            "-i", rebuilt_path,
+                            "-vf", f"tpad=stop_mode=clone:stop_duration={_pad_secs:.6f}",
+                            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                            _fixed_path,
+                        ]
+                    _fix_result = subprocess.run(_fix_cmd, capture_output=True, text=True, timeout=600)
+                    if _fix_result.returncode == 0:
+                        # Replace rebuilt_path with the fixed version
+                        try:
+                            os.remove(rebuilt_path)
+                        except Exception:
+                            pass
+                        rebuilt_path = _fixed_path
+                        video_path = rebuilt_path
+                    else:
+                        print(f"[merge] duration fix failed: {_fix_result.stderr[-300:]}")
+            except Exception as _dur_err:
+                print(f"[merge] duration check failed: {_dur_err}")
+
+            # Durations now match — simple mux (no padding/looping needed).
+            # Do NOT use -shortest: the slide_durations were chosen to match the
+            # audio, so cutting either stream short would de-sync the last slides.
+            # If there is a tiny mismatch the freeze/silence at the end is
+            # preferable to chopping off the final slide or its narration.
             job.update(progress=75, message="Combining audio and video...")
             cmd = [
                 settings.ffmpeg_binary, "-y",
@@ -180,7 +227,6 @@ def run_merge(
                 "-map", "1:a:0",
                 "-c:v", "copy",
                 "-c:a", "aac",
-                "-shortest",
                 output_path,
             ]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)

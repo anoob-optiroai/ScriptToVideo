@@ -268,10 +268,18 @@ def get_element_boxes(pptx_path: str, slide_idx: int, img_w: int, img_h: int) ->
             st = max(0, int(shape.top   * sy))
             sr = min(img_w, int((shape.left + shape.width)  * sx))
             sb = min(img_h, int((shape.top  + shape.height) * sy))
-            if sr <= sl + 10 or sb <= st + 10:
+
+            # ── LINE shapes are inherently thin — give them a minimum box ────
+            _is_line = (getattr(shape, "shape_type", None) == 10)
+            if _is_line:
+                if sr <= sl: sr = min(img_w, sl + 4)
+                if sb <= st: sb = min(img_h, st + 4)
+            elif sr <= sl + 10 or sb <= st + 10:
                 continue
 
-            # ── Text shape: split into per-paragraph rows ────────────────────
+            _stype = getattr(shape, "shape_type", None)
+
+            # ── Text shape ───────────────────────────────────────────────────
             if shape.has_text_frame:
                 tf = shape.text_frame
                 # Collect non-empty paragraph texts
@@ -279,20 +287,43 @@ def get_element_boxes(pptx_path: str, slide_idx: int, img_w: int, img_h: int) ->
                          if "".join(r.text for r in p.runs).strip()]
                 if not paras:
                     continue
+
+                # AUTO_SHAPE / CALLOUT / FREEFORM with a text frame are custom
+                # coloured boxes (e.g. "with defined roles" callout cards).
+                # They have their OWN fill colour distinct from the slide BG.
+                # If we split them into text rows and erase each row separately
+                # we leave the coloured box background visible at frame 0 while
+                # the text flickers in — ugly artifact.
+                # Fix: treat the whole box as a single "image" unit so the
+                # background and text reveal together as one block.
+                # Standard title / body placeholders (is_placeholder=True) are
+                # NOT coloured boxes and must still be split into rows.
+                _is_autoshape_box = (
+                    _stype in (1, 2, 5) and          # AUTO_SHAPE / CALLOUT / FREEFORM
+                    not getattr(shape, "is_placeholder", False)
+                )
+                if _is_autoshape_box:
+                    shape_area = max(1, sr - sl) * max(1, sb - st)
+                    if shape_area < img_w * img_h * 0.80:   # skip full-bleed BG rects
+                        elements.append((sl, st, sr, sb, "image"))
+                    continue
+
+                # Regular placeholder / text box: split into per-paragraph rows
                 n_p = len(paras)
                 shape_h = sb - st
                 row_h   = max(4, shape_h // n_p)
                 for pi, _ in enumerate(paras):
                     pt = st + pi * row_h
-                    pb = min(sb, st + (pi + 1) * row_h)
+                    # Last row extends all the way to the shape bottom so no
+                    # fraction of later-paragraph text is ever left un-erased.
+                    pb = sb if pi == n_p - 1 else min(sb, st + (pi + 1) * row_h)
                     if pb > pt + 2:
                         elements.append((sl, pt, sr, pb, "text"))
                 continue
 
             # ── Table shape: split into per-row animatable bands ─────────────
             # shape_type 19 = MSO_SHAPE_TYPE.TABLE
-            shape_type = getattr(shape, "shape_type", None)
-            if shape_type == 19 or getattr(shape, "has_table", False):
+            if _stype == 19 or getattr(shape, "has_table", False):
                 try:
                     tbl = shape.table
                     n_rows = len(tbl.rows)
@@ -309,15 +340,41 @@ def get_element_boxes(pptx_path: str, slide_idx: int, img_w: int, img_h: int) ->
 
             # ── Image / picture shape ────────────────────────────────────────
             # shape_type 13 = MSO_SHAPE_TYPE.PICTURE
-            # Also catch filled shapes that render as images
             try:
                 from pptx.enum.shapes import MSO_SHAPE_TYPE
                 is_pic = shape.shape_type == MSO_SHAPE_TYPE.PICTURE
             except Exception:
-                is_pic = (shape_type == 13)
+                is_pic = (_stype == 13)
 
             if is_pic:
-                elements.append((sl, st, sr, sb, "image"))
+                # NEVER erase picture/image shapes.  Images are reference
+                # material that should be visible from the first frame.
+                # Full-screen images get Ken Burns (separate path); smaller
+                # inset images should simply remain static on screen.
+                # Erasing images then trying to reveal them via element_timing
+                # produces blank slides whenever the delay exceeds the slide
+                # duration (which happens often due to timing drift).
+                continue
+
+            # ── Group shapes (type 6) ────────────────────────────────────────
+            # GROUP shapes contain nested child shapes (e.g. image placeholder
+            # + caption, icon clusters).  Without handling them here the group
+            # bounding box is never erased and shows at frame 0 as a coloured
+            # block (the teal box on the "Log Rolling" title slide, for example).
+            if _stype == 6:
+                shape_area = max(1, sr - sl) * max(1, sb - st)
+                if shape_area < img_w * img_h * 0.80:
+                    elements.append((sl, st, sr, sb, "image"))
+                continue
+
+            # ── Line / connector shapes ─────────────────────────────────────
+            # MSO_SHAPE_TYPE.LINE = 10; these are animatable structural elements
+            # (colored rule lines, dividers, connectors).  We treat them with
+            # kind "line" so the erase pass can use a larger padding to cover
+            # arrowheads / endpoints that extend outside the bounding box.
+            if _is_line:
+                elements.append((sl, st, sr, sb, "line"))
+                continue
 
         # Sort by vertical midpoint so reading order is respected
         elements.sort(key=lambda e: (e[1] + e[3]) / 2)
@@ -341,51 +398,94 @@ def get_slide_paragraph_texts(pptx_path: str, slide_idx: int) -> list:
     Used by compute_element_timestamps() in sync.py to match each visual
     element to the moment it is spoken in the voiceover.
 
+    CRITICAL: this function MUST return exactly the same number of elements
+    in the same order as get_element_boxes() so that element_timing delays
+    line up 1-to-1 with animation targets.  Any shape that get_element_boxes
+    skips or adds must be treated identically here.
+
     • Text paragraphs  → paragraph text string
     • Table rows       → space-joined cell text
-    • Images           → empty string  (no spoken text to match)
+    • Autoshape boxes  → combined text (one entry, matching get_element_boxes)
+    • Group shapes     → empty string  (only those with area < 80 % of slide)
+    • Line connectors  → empty string
+    • Pictures         → SKIPPED (get_element_boxes never adds them)
     """
     try:
         from pptx import Presentation
         prs = Presentation(pptx_path)
         if slide_idx >= len(prs.slides):
             return []
-        slide  = prs.slides[slide_idx]
-        items  = []   # [(raw_mid_y, text)]
+        slide      = prs.slides[slide_idx]
+        slide_area = prs.slide_width * prs.slide_height  # EMU²
+        items      = []   # [(raw_mid_y, text)]
 
         for shape in slide.shapes:
             l_r = shape.left  or 0
             t_r = shape.top   or 0
             r_r = l_r + (shape.width  or 0)
             b_r = t_r + (shape.height or 0)
-            if (r_r - l_r) < 10 or (b_r - t_r) < 10:
+
+            _stype_r = getattr(shape, "shape_type", None)
+            _is_line_r = (_stype_r == 10)
+
+            # ── Mirror the thin-shape guard in get_element_boxes ─────────────
+            if _is_line_r:
+                if r_r <= l_r: r_r = l_r + 10
+                if b_r <= t_r: b_r = t_r + 10
+            elif (r_r - l_r) < 10 or (b_r - t_r) < 10:
                 continue
 
+            # ── Text shapes ───────────────────────────────────────────────────
             if shape.has_text_frame:
                 tf    = shape.text_frame
                 paras = [p for p in tf.paragraphs
                          if "".join(run.text for run in p.runs).strip()]
                 if not paras:
                     continue
+
+                # AUTO_SHAPE / CALLOUT / FREEFORM with text: one entry in
+                # get_element_boxes if area < 80 % of slide; skip otherwise.
+                _is_autoshape_box_r = (
+                    _stype_r in (1, 2, 5) and
+                    not getattr(shape, "is_placeholder", False)
+                )
+                if _is_autoshape_box_r:
+                    shape_area_r = max(1, r_r - l_r) * max(1, b_r - t_r)
+                    if shape_area_r >= slide_area * 0.80:
+                        continue   # full-bleed BG rect — get_element_boxes skips it
+                    combined = " ".join(
+                        "".join(run.text for run in p.runs).strip()
+                        for p in paras
+                    ).strip()
+                    items.append(((t_r + b_r) / 2, combined))
+                    continue
+
+                # Regular placeholder / text box: per-paragraph rows.
+                # Mirror the row-height and last-row logic of get_element_boxes.
                 n_p     = len(paras)
                 h_r     = b_r - t_r
-                row_h_r = max(1, h_r // n_p)
+                row_h_r = max(4, h_r // n_p)
                 for pi, p in enumerate(paras):
                     pt_r = t_r + pi * row_h_r
-                    pb_r = min(b_r, t_r + (pi + 1) * row_h_r)
+                    # Last row extends to shape bottom (same as get_element_boxes)
+                    pb_r = b_r if pi == n_p - 1 else min(b_r, t_r + (pi + 1) * row_h_r)
+                    if pb_r <= pt_r + 2:
+                        continue   # too thin — get_element_boxes skips these too
                     text = "".join(run.text for run in p.runs).strip()
                     items.append(((pt_r + pb_r) / 2, text))
                 continue
 
-            shape_type = getattr(shape, "shape_type", None)
-            if shape_type == 19 or getattr(shape, "has_table", False):
+            # ── Table shape ───────────────────────────────────────────────────
+            if _stype_r == 19 or getattr(shape, "has_table", False):
                 try:
                     tbl   = shape.table
                     n_r   = len(tbl.rows)
-                    rh_r  = max(1, (b_r - t_r) // max(n_r, 1))
+                    rh_r  = max(4, (b_r - t_r) // max(n_r, 1))
                     for ri in range(n_r):
                         rt_r = t_r + ri * rh_r
                         rb_r = min(b_r, t_r + (ri + 1) * rh_r)
+                        if rb_r <= rt_r + 2:
+                            continue
                         row_text = " ".join(
                             cell.text_frame.text
                             for cell in tbl.rows[ri].cells
@@ -396,17 +496,36 @@ def get_slide_paragraph_texts(pptx_path: str, slide_idx: int) -> list:
                     items.append(((t_r + b_r) / 2, ""))
                 continue
 
+            # ── Picture shapes ────────────────────────────────────────────────
+            # get_element_boxes NEVER adds picture shapes (they are always
+            # visible from frame 0 or handled via Ken Burns).  Skipping here
+            # keeps the element count identical so element_timing aligns 1-to-1.
             try:
                 from pptx.enum.shapes import MSO_SHAPE_TYPE
                 is_pic = shape.shape_type == MSO_SHAPE_TYPE.PICTURE
             except Exception:
-                is_pic = (shape_type == 13)
+                is_pic = (_stype_r == 13)
             if is_pic:
+                continue   # SKIP — must match get_element_boxes behaviour
+
+            # ── Group shapes (type 6) ─────────────────────────────────────────
+            # get_element_boxes only adds groups whose area < 80 % of slide.
+            if _stype_r == 6:
+                shape_area_r = max(1, r_r - l_r) * max(1, b_r - t_r)
+                if shape_area_r < slide_area * 0.80:
+                    items.append(((t_r + b_r) / 2, ""))
+                # else: full-bleed group — get_element_boxes skips it, so do we
+                continue
+
+            # ── Line / connector shapes ───────────────────────────────────────
+            if _is_line_r:
                 items.append(((t_r + b_r) / 2, ""))
 
         items.sort(key=lambda x: x[0])
         return [text for _, text in items]
     except Exception:
+        import traceback
+        traceback.print_exc()
         return []
 
 
@@ -537,13 +656,16 @@ def _get_char_element_boxes(pptx_path: str, slide_idx: int, img_w: int, img_h: i
                 continue
 
             # ── Pictures ─────────────────────────────────────────────────────
+            # SKIP — pictures are never animated (always visible from frame 0).
+            # Including them would create an element count mismatch with
+            # element_timing (which now excludes pictures to match get_element_boxes).
             try:
                 from pptx.enum.shapes import MSO_SHAPE_TYPE
                 is_pic = shape.shape_type == MSO_SHAPE_TYPE.PICTURE
             except Exception:
                 is_pic = (shape_type == 13)
             if is_pic:
-                elements.append((sl, st, sr, sb, "image"))
+                continue   # SKIP — must match get_element_boxes behaviour
 
         # Sort top→bottom by row midpoint, left→right within each row
         elements.sort(key=lambda e: ((e[1] + e[3]) / 2, e[0]))
@@ -576,6 +698,54 @@ def _sample_bg_color(img_np, l: int, t: int, r: int, b: int) -> tuple:
     return (int(med[0]), int(med[1]), int(med[2]))
 
 
+def _get_slide_bg_color(img_np) -> tuple:
+    """
+    Sample the slide background color robustly.
+
+    Uses four corner regions, but if the top corners are significantly darker
+    than the bottom corners (dark header bar), only the bottom corners are used
+    so the detected color reflects the main content-area background rather than
+    the header band.  This prevents erase fills from picking up the header color
+    (e.g. dark blue/black) on slides that have a coloured title bar.
+    """
+    import numpy as np
+    h, w = img_np.shape[:2]
+    cs   = min(30, h // 4, w // 4)
+
+    tl = img_np[:cs, :cs].reshape(-1, 3)
+    tr = img_np[:cs, w - cs:].reshape(-1, 3)
+    bl = img_np[h - cs:, :cs].reshape(-1, 3)
+    br = img_np[h - cs:, w - cs:].reshape(-1, 3)
+
+    # Per-corner median brightness (0-255)
+    def _bright(px):
+        return float(np.median(px)) if px.size else 128.0
+
+    top_bright = (_bright(tl) + _bright(tr)) / 2
+    bot_bright  = (_bright(bl) + _bright(br)) / 2
+
+    if top_bright < bot_bright - 40:
+        # Dark header → use only bottom corners for content-area BG
+        use_corners = [bl, br]
+    elif bot_bright < top_bright - 40:
+        # Dark footer → use only top corners
+        use_corners = [tl, tr]
+    else:
+        use_corners = [tl, tr, bl, br]
+
+    all_px = np.concatenate([c for c in use_corners if c.size > 0], axis=0)
+    if all_px.size == 0:
+        return (255, 255, 255)
+    med = np.median(all_px, axis=0).astype(int)
+    return (int(med[0]), int(med[1]), int(med[2]))
+
+
+def _ease(t: float) -> float:
+    """Smoothstep ease-in-out: starts and ends gently (S-curve)."""
+    t = max(0.0, min(1.0, t))
+    return t * t * (3.0 - 2.0 * t)
+
+
 def _apply_elem_anim(frame, full_np, bg_np,
                      l: int, t_b: int, r: int, b: int,
                      anim_type: str, progress: float):
@@ -585,9 +755,18 @@ def _apply_elem_anim(frame, full_np, bg_np,
 
     Extracted so the same pixel logic is shared between the uniform animation
     path and the voiceover-synced path.
+
+    Smoothstep easing is applied to all motion-based animation types so the
+    entrance starts and ends gently rather than cutting in at full speed.
+    char_overshoot_scale has its own spring easing and is left untouched.
     """
     import numpy as _np
     import math  as _math
+
+    # Apply ease-in-out to linear progress for smooth entrances/exits.
+    # char_overshoot_scale handles its own spring-based timing.
+    if anim_type != "char_overshoot_scale":
+        progress = _ease(progress)
 
     if anim_type == "text_fade":
         frame[t_b:b, l:r] = (
@@ -669,22 +848,56 @@ def build_text_animated_clip(
         subprocess.run(_cmd, capture_output=True, timeout=120)
         return
 
-    # For char_overshoot_scale: get per-character column boxes for the animation
-    # loop while the background is still erased at shape granularity above.
+    # anim_elements is always paragraph-level (matches element_timing count).
+    # For char_overshoot_scale, we build a separate char-box map so each
+    # paragraph's characters animate individually within its timing window
+    # WITHOUT breaking the element_timing count check.
     anim_elements = elements
+
+    # ── Build paragraph→character map for char_overshoot_scale ───────────────
+    # Keys: paragraph index (into anim_elements)
+    # Values: list of character-column boxes within that paragraph
+    _para_char_map = {}   # {para_idx: [(l,t,r,b,kind), …]}
     if anim_type == "char_overshoot_scale" and pptx_path:
-        _char_elems = _get_char_element_boxes(pptx_path, slide_idx, iw, ih)
-        if _char_elems:
-            anim_elements = _char_elems
+        _all_chars = _get_char_element_boxes(pptx_path, slide_idx, iw, ih)
+        if _all_chars:
+            for _pi, _pelem in enumerate(anim_elements):
+                _pl, _pt, _pr, _pb, _ = _pelem
+                _chars = [
+                    c for c in _all_chars
+                    if c[1] >= _pt - 4 and c[3] <= _pb + 4 and
+                       c[0] >= _pl - 4 and c[2] <= _pr + 4
+                ]
+                if _chars:
+                    _para_char_map[_pi] = _chars
 
     # ── Create background PNG (all animated elements hidden with sampled BG) ──
     # Always erase at shape-level so the full text area is blanked before
-    # character-by-character animation draws each glyph column back in.
+    # animation draws content back in.
+    # A small pixel padding ensures text that renders slightly outside its
+    # declared bounding box (e.g. descenders, anti-aliased edges) is also
+    # covered, preventing "ghost" pixels of later lines showing at frame 0.
+    _ERASE_PAD      = 6    # px on each side for text / table rows (increased from 4)
+    _LINE_ERASE_PAD = 20   # extra pad for lines — arrowheads extend well past the bbox
     bg_img = img.copy()
     _draw  = ImageDraw.Draw(bg_img)
+    # Pre-compute slide background from corners — used for shapes with their own
+    # colored backgrounds (LINE, PICTURE) so adjacent-pixel sampling doesn't pick
+    # up neighboring shape colors and produce wrong-colored erase fills.
+    _slide_bg_color = _get_slide_bg_color(full_np)
     for (l, t, r, b, _kind) in elements:
-        color = _sample_bg_color(full_np, l, t, r, b)
-        _draw.rectangle([l, t, r, b], fill=color)
+        _pad = _LINE_ERASE_PAD if _kind == "line" else _ERASE_PAD
+        el = max(0, l - _pad)
+        et = max(0, t - _pad)
+        er = min(iw, r + _pad)
+        eb = min(ih, b + _pad)
+        if _kind in ("image", "line"):
+            # Shapes with their own color (lines, pictures) — use slide BG
+            color = _slide_bg_color
+        else:
+            # Text / table rows — sample just outside the element (more accurate)
+            color = _sample_bg_color(full_np, el, et, er, eb)
+        _draw.rectangle([el, et, er, eb], fill=color)
     bg_np = np.array(bg_img)
 
     n_elems   = len(anim_elements)
@@ -707,8 +920,14 @@ def build_text_animated_clip(
         """Build one numpy frame: revealed elements fully shown, active element animating."""
         f = bg_np.copy()
         for ri in revealed_set:
-            rl, rt, rr, rb, _ = anim_elements[ri]
-            f[rt:rb, rl:rr] = full_np[rt:rb, rl:rr]
+            rl, rt, rr, rb, _rk = anim_elements[ri]
+            # Restore the PADDED region (same as what was erased) so text that
+            # renders slightly outside its bounding box is fully visible — fixes
+            # the persistent "first characters cropped" bug.
+            _rp = _LINE_ERASE_PAD if _rk == "line" else _ERASE_PAD
+            _rel = max(0, rl - _rp); _ret = max(0, rt - _rp)
+            _rer = min(iw, rr + _rp); _reb = min(ih, rb + _rp)
+            f[_ret:_reb, _rel:_rer] = full_np[_ret:_reb, _rel:_rer]
         if active_ei is not None:
             al, at, ar, ab, _ = anim_elements[active_ei]
             _apply_elem_anim(f, full_np, bg_np, al, at, ar, ab, anim_type, progress)
@@ -716,42 +935,120 @@ def build_text_animated_clip(
 
     try:
         # ── Voiceover-synced path ─────────────────────────────────────────────
+        # Diagnostic: always log element count and whether we can use voiceover sync.
+        if element_delays is not None:
+            if len(element_delays) != n_elems:
+                print(f"[anim] slide {slide_idx+1}: element count MISMATCH — "
+                      f"element_timing has {len(element_delays)} entries but "
+                      f"get_element_boxes returned {n_elems} → falling back to uniform. "
+                      f"Re-run AI sync to regenerate element_timing.json.")
+                # Attempt graceful recovery: truncate / pad to match
+                if len(element_delays) > n_elems:
+                    element_delays = element_delays[:n_elems]
+                    print(f"[anim] slide {slide_idx+1}: truncated element_delays to {n_elems}")
+                else:
+                    # pad with zeros (show immediately) so no element is hidden
+                    element_delays = element_delays + [0.0] * (n_elems - len(element_delays))
+                    print(f"[anim] slide {slide_idx+1}: padded element_delays to {n_elems}")
+            else:
+                print(f"[anim] slide {slide_idx+1}: voiceover-sync active — "
+                      f"{n_elems} elements, delays {[round(d,1) for d in element_delays]}, "
+                      f"slide dur={duration:.1f}s")
+        else:
+            print(f"[anim] slide {slide_idx+1}: uniform animation — {n_elems} elements, "
+                  f"slide dur={duration:.1f}s (no element_timing)")
+
         if element_delays is not None and len(element_delays) == n_elems:
-            # Each element fades/wipes in over ELEM_ANIM_DUR seconds, starting
-            # exactly when the narrator begins speaking about it.
-            ELEM_ANIM_DUR = 0.4                      # seconds per element entrance
-            n_ea          = max(2, int(fps * ELEM_ANIM_DUR))
+            # Each element fades/wipes in at the voiceover-synced moment.
+            # For char_overshoot_scale: characters within each element animate
+            # sequentially (word-by-word typewriter effect) within a time budget
+            # proportional to the element's character count.
+            # For other modes: the whole element animates over ELEM_ANIM_DUR.
+            ELEM_ANIM_DUR = 0.4   # default entrance time (text_fade / wipe / slide_up)
+            # char_overshoot_scale: 3 frames per character, capped at 1.5 s per element
+            _CHAR_FRAMES = 3
 
-            # Clamp every delay so the element + its animation burst fits inside
-            # the slide duration.  This is essential when the user manually edits
-            # slide durations in the debug table — the Whisper-computed delays can
-            # exceed the new (shorter) duration, which would make the clip longer
-            # than requested and shift every subsequent transition cut point.
-            max_delay     = max(0.0, duration - ELEM_ANIM_DUR)
-            safe_delays   = [max(0.0, min(d, max_delay)) for d in element_delays]
+            max_delay = max(0.0, duration - ELEM_ANIM_DUR)
 
-            # Sort elements by their (clamped) voiceover delay
+            # ── Scale delays to fit inside the slide duration ─────────────────
+            _max_input = max(element_delays) if element_delays else 0
+            if _max_input > max_delay and _max_input > 0:
+                _scale = max_delay / _max_input
+                safe_delays = [round(max(0.0, d * _scale), 3) for d in element_delays]
+                print(f"[anim] slide {slide_idx+1}: max delay {_max_input:.1f}s > "
+                      f"slide {duration:.1f}s — rescaling ×{_scale:.3f}")
+            else:
+                safe_delays = [max(0.0, d) for d in element_delays]
+
+            # ── Safety: topmost element (title / heading) must appear first ───
+            if n_elems > 0:
+                _top_idx = min(range(n_elems), key=lambda i: anim_elements[i][1])
+                safe_delays[_top_idx] = 0.0
+
+            # Sort elements by their voiceover delay
             order    = sorted(range(n_elems), key=lambda i: safe_delays[i])
             revealed = set()
-            t_cursor = 0.0   # seconds already accounted for
+            t_cursor = 0.0   # seconds already written to frame_list
 
             for ei in order:
                 d   = safe_delays[ei]
-                gap = d - t_cursor
+                gap = max(0.0, d - t_cursor)
 
-                # Static frame covering the gap before this element appears
+                # Static hold frame covering the gap before this element
                 if gap > frame_dur * 0.5:
                     fp = _save_frame(_compose(revealed))
                     frame_list.append((fp, round(gap, 6)))
+                    t_cursor += round(gap, 6)
 
-                # Short animation burst for this element
-                for fi in range(n_ea):
-                    prog = fi / max(n_ea - 1, 1)
-                    fp   = _save_frame(_compose(revealed, active_ei=ei, progress=prog))
-                    frame_list.append((fp, frame_dur))
+                t_cursor = max(t_cursor, d)
+
+                # ── Animation burst for this element ─────────────────────────
+                _chars = _para_char_map.get(ei, []) if anim_type == "char_overshoot_scale" else []
+
+                if _chars:
+                    # char_overshoot_scale: animate each character column
+                    # sequentially — gives the word-by-word typewriter effect.
+                    n_chars    = len(_chars)
+                    burst_dur  = min(n_chars * _CHAR_FRAMES / fps, 1.5)
+                    burst_dur  = max(frame_dur * 2, burst_dur)
+                    n_burst    = max(2, round(burst_dur * fps))
+                    # Only animate if there's time budget remaining
+                    if t_cursor + burst_dur <= duration + frame_dur:
+                        for _fi in range(n_burst):
+                            _t = _fi / max(n_burst - 1, 1)
+                            _fr = _compose(revealed)  # already-revealed elements
+                            for _ci, _cbox in enumerate(_chars):
+                                _cs = _ci / n_chars
+                                _ce = (_ci + 1) / n_chars
+                                _cp = min(1.0, max(0.0,
+                                    (_t - _cs) / max(_ce - _cs, 0.001)))
+                                if _cp <= 0:
+                                    continue
+                                _cl, _ct, _cr, _cb, _ = _cbox
+                                if _t >= _ce:
+                                    _fr[_ct:_cb, _cl:_cr] = full_np[_ct:_cb, _cl:_cr]
+                                else:
+                                    _apply_elem_anim(_fr, full_np, bg_np,
+                                                     _cl, _ct, _cr, _cb,
+                                                     anim_type, _cp)
+                            frame_list.append((_save_frame(_fr), frame_dur))
+                        t_cursor += burst_dur
+                    # else: element appears instantly
+                else:
+                    # Standard entrance animation for text_fade / text_wipe /
+                    # text_slide_up — or char_overshoot_scale fallback when no
+                    # char boxes were found (empty / image element).
+                    n_ea = max(2, int(fps * ELEM_ANIM_DUR))
+                    if t_cursor + ELEM_ANIM_DUR <= duration + frame_dur:
+                        for fi in range(n_ea):
+                            prog = fi / max(n_ea - 1, 1)
+                            fp   = _save_frame(_compose(revealed, active_ei=ei, progress=prog))
+                            frame_list.append((fp, frame_dur))
+                        t_cursor += ELEM_ANIM_DUR
+                # else: element appears instantly (no animation burst) when
+                # there is no remaining time budget — avoids over-long clips.
 
                 revealed.add(ei)
-                t_cursor = d + ELEM_ANIM_DUR
 
             # Final hold: all elements fully visible for the rest of the slide.
             remaining = duration - t_cursor
@@ -773,29 +1070,68 @@ def build_text_animated_clip(
                 last_fp, last_dur = frame_list[-1]
                 frame_list[-1] = (last_fp, round(max(frame_dur, last_dur + drift), 6))
 
-        # ── Uniform animation path (original behaviour, unchanged) ────────────
+        # ── Uniform animation path ────────────────────────────────────────────
         else:
+            # For char_overshoot_scale: flatten all per-paragraph char boxes
+            # into one list so that characters animate sequentially across the
+            # whole slide (paragraph by paragraph, char by char within each).
+            if anim_type == "char_overshoot_scale" and _para_char_map:
+                _all_flat_chars = []
+                for _pi in range(n_elems):
+                    _all_flat_chars.extend(_para_char_map.get(_pi, [anim_elements[_pi]]))
+                _unif_elems = _all_flat_chars
+            else:
+                _unif_elems = anim_elements
+
+            _ue_count = len(_unif_elems)
             if anim_type == "char_overshoot_scale":
-                FRAMES_PER_CHAR = 8
-                n_anim     = max(2, min(n_elems * FRAMES_PER_CHAR, int(fps * 5.0)))
+                FRAMES_PER_CHAR = 4   # 4 frames/char = 0.16 s per char at 25 fps
+                n_anim     = max(2, min(_ue_count * FRAMES_PER_CHAR, int(fps * 5.0)))
                 total_anim = n_anim / fps
             else:
-                total_anim = min(anim_dur * n_elems, 3.0)
+                total_anim = min(anim_dur * _ue_count, 3.0)
                 n_anim     = max(2, int(fps * total_anim))
             n_hold = max(1, int(fps * max(0.04, duration - total_anim)))
+
+            # ── Safety: topmost element (title / heading) visible from frame 0 ──
+            # Mirror the voiceover-synced path's guarantee: the topmost element
+            # (smallest t coordinate) is pre-revealed in the background frame so
+            # it appears immediately, even for slides whose title is a coloured
+            # autoshape banner (orange / red header bars with icon + text).
+            # This fixes "title missing at slide start" on slides where the banner
+            # is erased to the slide BG colour and then revealed char-by-char.
+            if n_elems > 0:
+                _ti = min(range(n_elems), key=lambda i: anim_elements[i][1])
+                _tl2, _tt2, _tr2, _tb2, _tk2 = anim_elements[_ti]
+                _tp2 = _LINE_ERASE_PAD if _tk2 == "line" else _ERASE_PAD
+                _trl = max(0, _tl2 - _tp2); _trt = max(0, _tt2 - _tp2)
+                _trr = min(iw, _tr2 + _tp2); _trb = min(ih, _tb2 + _tp2)
+                # Write the topmost element into bg_np so every animation frame
+                # starts with it already visible — safe because bg_np is never
+                # written back to disk, only used as a compositing base.
+                bg_np[_trt:_trb, _trl:_trr] = full_np[_trt:_trb, _trl:_trr]
+                print(f"[anim] slide {slide_idx+1}: topmost element pre-revealed "
+                      f"({_tl2},{_tt2},{_tr2},{_tb2} kind={_tk2})")
 
             for fi in range(n_anim):
                 t_frac = fi / max(n_anim - 1, 1)
                 frame  = bg_np.copy()
-                for bi, (l, t_b, r, b, _kind) in enumerate(anim_elements):
-                    ei_start = bi / n_elems
-                    ei_end   = (bi + 1) / n_elems
+                # Restore already-fully-revealed elements (with padded region,
+                # matching the erase step so no 6px border remains erased)
+                for bi, (l, t_b, r, b, _ek) in enumerate(_unif_elems):
+                    ei_start = bi / _ue_count
+                    ei_end   = (bi + 1) / _ue_count
                     progress = min(1.0, max(0.0,
                         (t_frac - ei_start) / max(ei_end - ei_start, 0.001)))
                     if progress <= 0:
                         continue
                     if t_frac >= ei_end:
-                        frame[t_b:b, l:r] = full_np[t_b:b, l:r]
+                        # Use padded reveal (same extents as erase) so the 6px
+                        # border erased around each element is always restored.
+                        _rkp = _LINE_ERASE_PAD if _ek == "line" else _ERASE_PAD
+                        _rl2 = max(0, l - _rkp);  _rt2 = max(0, t_b - _rkp)
+                        _rr2 = min(iw, r + _rkp); _rb2 = min(ih, b + _rkp)
+                        frame[_rt2:_rb2, _rl2:_rr2] = full_np[_rt2:_rb2, _rl2:_rr2]
                         continue
                     _apply_elem_anim(frame, full_np, bg_np, l, t_b, r, b,
                                      anim_type, progress)
@@ -816,11 +1152,13 @@ def build_text_animated_clip(
 
         scale_vf = (f"scale={out_width}:{out_height}:force_original_aspect_ratio=decrease,"
                     f"pad={out_width}:{out_height}:(ow-iw)/2:(oh-ih)/2")
+        target_frames = max(1, round(duration * fps))
         cmd = [
             settings.ffmpeg_binary, "-y",
             "-f", "concat", "-safe", "0", "-i", concat_txt,
             "-vf", scale_vf,
             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", str(fps),
+            "-frames:v", str(target_frames),
             out_path,
         ]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
@@ -882,6 +1220,142 @@ def _get_video_duration(path: str) -> float:
     return 0.0
 
 
+# ── Ken Burns (slow zoom / pan) detection & clip building ────────────────────
+
+_KB_EFFECTS = ["zoom_in", "zoom_out", "pan_right", "pan_left", "pan_up", "pan_down"]
+
+
+def _detect_fullscreen_image_slides(pptx_path: str) -> list:
+    """
+    Return list[bool] — True for every slide whose picture shapes collectively
+    cover ≥ 30 % of the slide area (i.e. it is dominated by a large photo).
+
+    Detects both directly inserted pictures (MSO_SHAPE_TYPE.PICTURE = 13) and
+    picture placeholders that have been filled with an image (shape_type 14),
+    which python-pptx reports as PLACEHOLDER but still exposes a .image attr.
+    Returns an empty list if pptx_path is None / unreadable.
+    """
+    if not pptx_path:
+        return []
+    try:
+        from pptx import Presentation
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+        prs = Presentation(pptx_path)
+        slide_area = prs.slide_width * prs.slide_height
+        def _check_shape_for_big_image(shape, slide_area, MSO_SHAPE_TYPE):
+            """Return True if shape (or any descendant) is a large picture."""
+            try:
+                # Recurse into GROUP shapes (type 6)
+                if shape.shape_type == 6:
+                    for child in shape.shapes:
+                        if _check_shape_for_big_image(child, slide_area, MSO_SHAPE_TYPE):
+                            return True
+                    return False
+                # Skip shapes that are too small regardless
+                if shape.width * shape.height < slide_area * 0.25:
+                    return False
+                # Direct picture shapes (Insert > Picture)
+                is_pic = shape.shape_type == MSO_SHAPE_TYPE.PICTURE
+                if not is_pic:
+                    # Picture placeholders filled with an image expose .image
+                    try:
+                        _ = shape.image
+                        is_pic = True
+                    except Exception:
+                        pass
+                return is_pic
+            except Exception:
+                return False
+
+        results = []
+        for idx, slide in enumerate(prs.slides):
+            big_image = False
+            for shape in slide.shapes:
+                if _check_shape_for_big_image(shape, slide_area, MSO_SHAPE_TYPE):
+                    big_image = True
+                    break
+            results.append(big_image)
+            if big_image:
+                print(f"[kenburns-detect] Slide {idx + 1}: full-screen image detected")
+        kb_count = sum(results)
+        print(f"[kenburns-detect] {kb_count} full-screen image slide(s) out of {len(results)}")
+        return results
+    except Exception as e:
+        print(f"[kenburns-detect] Detection failed: {e}")
+        return []
+
+
+def _build_kenburns_clip(img_path: str, duration: float, width: int, height: int,
+                          out_path: str, fps: int = 25, slide_idx: int = 0) -> None:
+    """
+    Encode a still image into a video with a slow Ken Burns (zoom / pan) effect.
+
+    Effect cycles deterministically through slide_idx so consecutive slides get
+    different effects (zoom_in → zoom_out → pan_right → pan_left → pan_up → pan_down).
+
+    Zoom effects use FFmpeg's ``zoompan`` filter (8 % range, centred).
+    Pan effects use scale + animated crop (10 % scale-up) — much faster to encode.
+    """
+    import math as _math
+    effect = _KB_EFFECTS[slide_idx % len(_KB_EFFECTS)]
+    # Use round() — same rounding as text-anim clips and _apply_alpha_transitions
+    # so all clip durations are consistent and filter trim timestamps never overshoot.
+    total_frames = max(25, round(duration * fps))
+    w, h = int(width), int(height)
+
+    ZOOM_AMT = 0.08  # 8 % zoom range — subtle but clearly visible
+
+    if effect == "zoom_in":
+        step = ZOOM_AMT / total_frames
+        vf = (
+            f"zoompan=z='min(zoom+{step:.8f},1+{ZOOM_AMT})'"
+            f":d={total_frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+            f":s={w}x{h}:fps={fps}"
+        )
+    elif effect == "zoom_out":
+        step = ZOOM_AMT / total_frames
+        vf = (
+            f"zoompan=z='if(eq(on,1),1+{ZOOM_AMT},max(zoom-{step:.8f},1.0))'"
+            f":d={total_frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+            f":s={w}x{h}:fps={fps}"
+        )
+    else:
+        # Pan effects: scale to 110 %, then animate the crop origin
+        PAN = 1.10
+        sw = round(w * PAN); sw += sw % 2
+        sh = round(h * PAN); sh += sh % 2
+        dx, dy = sw - w, sh - h
+        cx, cy = dx // 2, dy // 2
+
+        if effect == "pan_right":
+            cx_expr, cy_expr = f"min({dx}*on/{total_frames},{dx})", str(cy)
+        elif effect == "pan_left":
+            cx_expr, cy_expr = f"max({dx}*(1-on/{total_frames}),0)", str(cy)
+        elif effect == "pan_up":
+            cx_expr, cy_expr = str(cx), f"min({dy}*on/{total_frames},{dy})"
+        else:  # pan_down
+            cx_expr, cy_expr = str(cx), f"max({dy}*(1-on/{total_frames}),0)"
+
+        vf = (
+            f"scale={sw}:{sh}:force_original_aspect_ratio=increase,"
+            f"crop={w}:{h}:x='{cx_expr}':y='{cy_expr}',"
+            f"setsar=1"
+        )
+
+    cmd = [
+        settings.ffmpeg_binary, "-y",
+        "-loop", "1", "-i", img_path,
+        "-t", str(round(duration, 6)),
+        "-vf", vf,
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", str(fps),
+        "-frames:v", str(total_frames),
+        out_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(f"Ken Burns encode error: {result.stderr[-400:]}")
+
+
 def _apply_alpha_transitions(
     slide_clips: list,
     transition_clip: str,
@@ -890,51 +1364,41 @@ def _apply_alpha_transitions(
     abs_out: str,
     overlap_frames: int = 15,
     fps: int = 25,
-    slide_durations: list = None,   # optional: avoids probing each clip
+    slide_durations: list = None,
 ) -> str:
     """
-    Composite the custom transition clip over each slide cut so that it
-    OVERLAPS the end of the outgoing clip and the start of the incoming clip.
+    Composite the transition clip at each slide cut using a per-window approach.
 
-    How it works
-    ────────────
-    1.  Concatenate all slide clips into a single base video (hard cuts).
-    2.  Compute the cut points (seconds) = cumulative slide durations.
-    3.  For every cut point T, offset the transition clip by (T - overlap_secs)
-        using setpts, then overlay it with format=auto so the alpha channel is
-        respected.  eof_action=pass restores the base video after the transition
-        finishes.
-    4.  Chain all overlays and encode once.
+    For each slide boundary, a short (~1.2 s) window is extracted, the alpha
+    transition is overlaid, and all pieces are reassembled with the FFmpeg
+    concat demuxer.  This avoids the 32 KB Windows command-line limit that
+    a single filter_complex hits at ~20+ slides and prevents the
+    'split=N' memory spike with large N.
 
-    Timeline illustration (overlap = 15 frames at 25 fps = 0.60 s):
+    Timeline (overlap = 15 frames @ 25 fps = 0.60 s):
         ┌──── slide A ────┬──── slide B ────┐
-                    ↑ cut point T  (= transition frame 15 at 25 fps)
-        ┌──── slide A ───[=== trans ===]─────────── slide B ──────┐
-                       ↑ overlay starts at T - 0.60 s
-    NOTE: fps here is the transition clip's frame rate (25), which also
-    matches the base video fps.  The hard cut in the base video aligns with
-    exactly frame 15 of the transition — the frame where the screen is fully
-    covered — so the cover phase hides the cut and the reveal phase uncovers
-    the incoming slide seamlessly.
+                     ↑ T-0.60s  ↑ T+0.60s
+        base:  plain_A | window | plain_B | ...
+        out:   plain_A | overlay(trans) | plain_B | ...
     """
+    import shutil as _shutil
     overlap_secs = overlap_frames / fps
-    ffmpeg = settings.ffmpeg_binary
+    ffmpeg       = settings.ffmpeg_binary
+    w, h         = width, height
+    VIDEO_FPS    = fps
+    ONE_FRAME    = 1.0 / VIDEO_FPS
 
-    # ── Step 1: measure clip durations BEFORE building base (clips still exist)
+    # ── 1. Quantize slide durations to whole frames (same rounding as encoder) ─
     if slide_durations and len(slide_durations) == len(slide_clips):
-        clip_durs = slide_durations
+        clip_durs = list(slide_durations)
     else:
         clip_durs = [_get_video_duration(p) for p in slide_clips]
 
-    # Quantize each clip duration to the nearest video-frame boundary (1/25 s).
-    # Without this, floating-point accumulation in cut_times grows to 2–3 frames
-    # of error by slide 20+, causing the transition overlay to land at the wrong
-    # moment.  Rounding to the nearest frame keeps all cut_times sub-frame accurate.
-    VIDEO_FPS = 25
-    clip_durs = [round(round(d * VIDEO_FPS) / VIDEO_FPS, 6) for d in clip_durs]
+    frame_counts = [max(1, round(d * VIDEO_FPS)) for d in clip_durs]
+    clip_durs    = [fc / VIDEO_FPS for fc in frame_counts]
 
-    # ── Step 2: build base video (all slides, hard cuts) ─────────────────────
-    base = abs_out + "_base.mp4"
+    # ── 2. Concat slide clips into base video ─────────────────────────────────
+    base      = abs_out + "_base.mp4"
     list_file = abs_out + "_base_cl.txt"
     with open(list_file, "w", encoding="utf-8") as f:
         for p in slide_clips:
@@ -944,80 +1408,107 @@ def _apply_alpha_transitions(
          "-c", "copy", base],
         capture_output=True, text=True, timeout=600,
     )
-    try:
-        os.remove(list_file)
-    except Exception:
-        pass
+    try: os.remove(list_file)
+    except Exception: pass
     if r.returncode != 0:
         raise RuntimeError(f"Base concat error: {r.stderr[-200:]}")
-
-    # Clean up slide clips now that base is built
     for p in slide_clips:
-        try:
-            os.remove(p)
-        except Exception:
-            pass
+        try: os.remove(p)
+        except Exception: pass
 
-    # ── Step 3: compute cut points (cumulative durations) ─────────────────────
+    # ── 3. Compute cut points (frame-accurate, no float drift) ───────────────
     cut_times = []
-    t_acc = 0.0
-    for d in clip_durs[:-1]:   # last slide has no transition after it
-        t_acc += d
-        cut_times.append(round(t_acc, 4))
+    frame_acc = 0
+    for fc in frame_counts[:-1]:
+        frame_acc += fc
+        cut_times.append(frame_acc / VIDEO_FPS)
 
     if not cut_times:
-        try:
-            os.rename(base, abs_out)
-        except Exception:
-            pass
+        try: os.rename(base, abs_out)
+        except Exception: pass
         return abs_out
 
-    # ── Step 3: build filter_complex with chained overlays ────────────────────
-    # Inputs: [0] base, [1..N] one copy of transition per cut
-    n_cuts   = len(cut_times)
-    w, h     = width, height
+    # ── 4. Transition info ────────────────────────────────────────────────────
+    trans_dur = _get_video_duration(transition_clip)
+    if trans_dur <= 0:
+        trans_dur = 2 * overlap_secs
+    # Probe actual base duration so tail segment never overshoots
+    base_dur_actual = _get_video_duration(base)
     scale_vf = (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
                 f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2")
 
-    input_args = [ffmpeg, "-y", "-i", base]
-    for _ in cut_times:
-        input_args += ["-i", transition_clip]
+    # ── 5. Build segment list ─────────────────────────────────────────────────
+    segments  = []   # ("plain"|"overlay", t0, t1)
+    prev_end  = 0.0
+    for t_cut in cut_times:
+        t0 = max(prev_end, t_cut - overlap_secs)
+        t1 = min(base_dur_actual, t0 + trans_dur)
+        if t1 - t0 < ONE_FRAME:
+            continue
+        if t0 - prev_end >= ONE_FRAME:
+            segments.append(("plain",   prev_end, t0))
+        segments.append(    ("overlay", t0,       t1))
+        prev_end = t1
+    if base_dur_actual - prev_end >= ONE_FRAME:
+        segments.append(("plain", prev_end, base_dur_actual))
 
-    filter_parts = []
-    prev_label   = "0:v"
+    # ── 6. Encode each segment individually ──────────────────────────────────
+    # Plain segments use -c copy (fast); overlay segments re-encode (~1.2 s each).
+    seg_dir   = abs_out + "_segtmp"
+    os.makedirs(seg_dir, exist_ok=True)
+    seg_paths = []
+    timeout_secs = max(1800, int(base_dur_actual * 5))
 
-    for idx, t_cut in enumerate(cut_times):
-        t_start     = max(0.0, t_cut - overlap_secs)
-        trans_input = idx + 1
-        tr_label    = f"tr{idx}"
-        ov_label    = f"ov{idx}"
+    for si, (kind, t0, t1) in enumerate(segments):
+        seg_path = os.path.join(seg_dir, f"seg{si:05d}.mp4")
+        dur      = t1 - t0
 
-        # Offset the transition so it starts at t_start in the base timeline
-        filter_parts.append(
-            f"[{trans_input}:v]{scale_vf},setpts=PTS+{t_start:.4f}/TB[{tr_label}]"
-        )
-        # Overlay with alpha support; after transition EOF, pass through base
-        filter_parts.append(
-            f"[{prev_label}][{tr_label}]overlay=0:0:format=auto:eof_action=pass[{ov_label}]"
-        )
-        prev_label = ov_label
+        if kind == "plain":
+            # Seek-and-copy: fast, uses keyframe alignment.
+            # For the first segment (t0=0) use simple trim; for others seek.
+            cmd = [
+                ffmpeg, "-y",
+                "-ss", f"{t0:.6f}", "-i", base,
+                "-t",  f"{dur:.6f}",
+                "-c", "copy",
+                seg_path,
+            ]
+        else:
+            # Overlay the transition clip on this short window
+            cmd = [
+                ffmpeg, "-y",
+                "-ss", f"{t0:.6f}", "-t", f"{dur:.6f}", "-i", base,
+                "-i", transition_clip,
+                "-filter_complex",
+                (f"[0:v]setpts=PTS-STARTPTS[bw];"
+                 f"[1:v]{scale_vf}[ts];"
+                 f"[bw][ts]overlay=0:0:format=auto:eof_action=pass[out]"),
+                "-map", "[out]",
+                "-t", f"{dur:.6f}",
+                "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+                seg_path,
+            ]
 
-    filter_complex = ";".join(filter_parts)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            # Fallback: copy the plain base segment so the video stays intact
+            fb_cmd = [
+                ffmpeg, "-y",
+                "-ss", f"{t0:.6f}", "-i", base,
+                "-t",  f"{dur:.6f}",
+                "-c", "copy", seg_path,
+            ]
+            subprocess.run(fb_cmd, capture_output=True, timeout=60)
+        seg_paths.append(seg_path)
 
-    cmd = input_args + [
-        "-filter_complex", filter_complex,
-        "-map",   f"[{prev_label}]",
-        "-c:v",   "libx264",
-        "-pix_fmt", "yuv420p",
-        abs_out,
-    ]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-    try:
-        os.remove(base)
-    except Exception:
-        pass
-    if r.returncode != 0:
-        raise RuntimeError(f"Alpha transition overlay error: {r.stderr[-400:]}")
+    # ── 7. Concat all segments into final output ──────────────────────────────
+    _concat_clips(seg_paths, abs_out)
+
+    try: os.remove(base)
+    except Exception: pass
+    try: _shutil.rmtree(seg_dir, ignore_errors=True)
+    except Exception: pass
+
     return abs_out
 
 
@@ -1052,6 +1543,38 @@ def build_video_from_images(
         durations.append(slide_duration)
     durations = durations[:len(images)]
 
+    # ── Ken Burns detection ───────────────────────────────────────────────────
+    # Detect which slides have a dominant full-screen image so we can apply a
+    # slow zoom / pan instead of rendering them as a static still.
+    kb_slides = _detect_fullscreen_image_slides(pptx_path) if pptx_path else []
+
+    def _make_slide_clip(img: str, dur: float, clip_path: str, slide_i: int) -> None:
+        """Build one slide clip: Ken Burns if detected, otherwise plain static."""
+        if kb_slides and slide_i < len(kb_slides) and kb_slides[slide_i]:
+            effect = _KB_EFFECTS[slide_i % len(_KB_EFFECTS)]
+            try:
+                _build_kenburns_clip(
+                    os.path.abspath(img), dur, int(width), int(height),
+                    clip_path, fps=25, slide_idx=slide_i,
+                )
+                print(f"[kenburns] Slide {slide_i+1}: {effect} applied ✓ ({dur:.1f}s)")
+                return
+            except Exception as e:
+                import traceback as _tb
+                print(f"[kenburns] Slide {slide_i+1} fallback to static: {e}")
+                _tb.print_exc()
+        # Plain static clip
+        cmd = [
+            settings.ffmpeg_binary, "-y",
+            "-loop", "1", "-t", str(dur), "-i", os.path.abspath(img),
+            "-vf", (f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                    f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"),
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "25", clip_path,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            raise RuntimeError(f"FFmpeg slide clip error {slide_i+1}: {r.stderr[-200:]}")
+
     # ── Text animation modes (PIL-based per-element animation) ───────────────
     TEXT_ANIM_MODES = {"text_fade", "text_slide_up", "text_wipe", "char_overshoot_scale"}
     if animation in TEXT_ANIM_MODES:
@@ -1065,6 +1588,23 @@ def build_video_from_images(
         for i, (img, dur) in enumerate(zip(images, durations)):
             _report(i / n_slides)          # progress: 0% … (n-1)/n before concat
             clip = abs_out.replace(".mp4", f"_tclip{i}.mp4")
+
+            # Full-screen image slide → Ken Burns instead of text animation
+            if kb_slides and i < len(kb_slides) and kb_slides[i]:
+                _kb_effect = _KB_EFFECTS[i % len(_KB_EFFECTS)]
+                try:
+                    _build_kenburns_clip(
+                        os.path.abspath(img), dur, out_w, out_h,
+                        clip, fps=25, slide_idx=i,
+                    )
+                    print(f"[kenburns] Slide {i+1}: {_kb_effect} applied ✓ ({dur:.1f}s)")
+                    clip_paths.append(clip)
+                    continue
+                except Exception as e:
+                    import traceback as _tb
+                    print(f"[kenburns] Slide {i+1} fallback to text_anim: {e}")
+                    _tb.print_exc()
+
             # Per-slide element delays from voiceover sync (None → uniform fallback)
             slide_elem_delays = (
                 element_timing[i]
@@ -1090,14 +1630,7 @@ def build_video_from_images(
                 import traceback
                 print(f"[text_anim] Slide {i+1} failed: {e}")
                 traceback.print_exc()
-                cmd = [
-                    settings.ffmpeg_binary, "-y",
-                    "-loop", "1", "-t", str(dur), "-i", os.path.abspath(img),
-                    "-vf", (f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-                            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"),
-                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "25", clip,
-                ]
-                subprocess.run(cmd, capture_output=True, timeout=120)
+                _make_slide_clip(img, dur, clip, i)
             clip_paths.append(clip)
 
         _report(0.9)  # 90% — about to concatenate
@@ -1120,18 +1653,32 @@ def build_video_from_images(
             _report(i / n_slides)
             clip = abs_out.replace(".mp4", f"_aclip{i}.mp4")
 
+            # Full-screen image slide → Ken Burns instead of entrance animation
+            if kb_slides and i < len(kb_slides) and kb_slides[i]:
+                _kb_eff2 = _KB_EFFECTS[i % len(_KB_EFFECTS)]
+                try:
+                    _build_kenburns_clip(
+                        os.path.abspath(img), dur, int(width), int(height),
+                        clip, fps=25, slide_idx=i,
+                    )
+                    print(f"[kenburns] Slide {i+1}: {_kb_eff2} applied ✓ ({dur:.1f}s)")
+                    clip_paths.append(clip)
+                    continue
+                except Exception as e:
+                    import traceback as _tb
+                    print(f"[kenburns] Slide {i+1} fallback to anim: {e}")
+                    _tb.print_exc()
+
             if animation == "fade_in":
                 vf = (f"fade=t=in:st=0:d={anim_dur},"
                       f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
                       f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2")
             elif animation == "slide_in_right":
-                # Slide image in from the right edge
                 vf = (f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
                       f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
                       f"crop={width}:{height}:"
                       f"'if(lt(t,{anim_dur}),(1-t/{anim_dur})*{width},0)':0")
             elif animation == "zoom_in":
-                # Gentle zoom from 110% → 100%
                 vf = (f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
                       f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
                       f"zoompan=z='if(lt(t,{anim_dur}),1.1-(0.1*t/{anim_dur}),1)'"
@@ -1172,16 +1719,7 @@ def build_video_from_images(
         for i, (img, dur) in enumerate(zip(images, durations)):
             _report(i / n_slides)
             clip = abs_out.replace(".mp4", f"_plain{i}.mp4")
-            cmd = [
-                settings.ffmpeg_binary, "-y",
-                "-loop", "1", "-t", str(dur), "-i", os.path.abspath(img),
-                "-vf", (f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-                        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"),
-                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "25", clip,
-            ]
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            if r.returncode != 0:
-                raise RuntimeError(f"FFmpeg slide clip error {i+1}: {r.stderr[-200:]}")
+            _make_slide_clip(img, dur, clip, i)   # Ken Burns if full-screen image detected
             plain_clips.append(clip)
         _report(0.9)
         _apply_alpha_transitions(plain_clips, transition_clip, width, height,
