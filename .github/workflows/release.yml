@@ -54,7 +54,7 @@ jobs:
         working-directory: electron
         shell: pwsh
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
         run: |
           npm ci
           npx electron-builder --win --publish always
@@ -128,7 +128,7 @@ jobs:
       - name: Build Electron DMG (macOS)
         working-directory: electron
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
           npm ci
@@ -169,4 +169,4 @@ jobs:
             artifacts/macos-dmg/*.dmg
             artifacts/macos-dmg/latest-mac.yml
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
