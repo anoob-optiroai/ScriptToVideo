@@ -228,12 +228,12 @@ function startBackend() {
   });
 }
 
-/** Poll http://127.0.0.1:${BACKEND_PORT}/health until it returns 200 or timeout. */
+/** Poll the backend /health endpoint until it returns 200 or timeout. */
 function waitForBackend(maxAttempts = 60) {
   return new Promise((resolve, reject) => {
     let attempts = 0;
     const check = () => {
-      const req = http.get("http://127.0.0.1:${BACKEND_PORT}/health", (res) => {
+      const req = http.get(`http://127.0.0.1:${BACKEND_PORT}/health`, (res) => {
         if (res.statusCode === 200) {
           resolve();
         } else {
