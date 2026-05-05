@@ -5,7 +5,12 @@ import {
   Play, Pause, Square, Save, FolderOpen, Trash2, Edit2
 } from "lucide-react";
 
-const API_BASE = "http://localhost:8000";
+// When served by the packaged backend (port 8765) or the dev backend (port 8000),
+// use the same origin so API calls work regardless of which port is in use.
+// In Vite dev mode the frontend is on :5173, so we fall back to :8000.
+const API_BASE = window.location.port === "5173"
+  ? "http://localhost:8000"
+  : window.location.origin;
 
 async function pollJob(jobId, onProgress) {
   return new Promise((resolve, reject) => {

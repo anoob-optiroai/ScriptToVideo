@@ -22,6 +22,14 @@ let backendProcess = null;
 let mainWindow     = null;
 let splashWindow   = null;
 
+// ── Port config ───────────────────────────────────────────────────────────────
+// Packaged app uses 8765 to avoid conflicting with a dev server on 8000.
+// Dev mode (npm start / NODE_ENV=development) uses 5173 (Vite) for the UI
+// and 8000 for the backend.
+const BACKEND_PORT = 8765;
+const DEV_UI_URL   = "http://127.0.0.1:5173/";
+const PROD_URL     = `http://127.0.0.1:${BACKEND_PORT}/`;
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function isDev() {
@@ -181,6 +189,7 @@ function startBackend() {
     VIDEO_OUTPUT_DIR:  path.join(userData, "outputs", "video"),
     UPLOAD_DIR:        path.join(userData, "uploads"),
     FFMPEG_BINARY:     fs.existsSync(ffmpegBin) ? ffmpegBin : "ffmpeg",
+    BACKEND_PORT:      String(BACKEND_PORT),  // tell startup.py which port to bind
   });
 
   console.log("[electron] Starting backend:", exe);
@@ -219,12 +228,12 @@ function startBackend() {
   });
 }
 
-/** Poll http://127.0.0.1:8000/health until it returns 200 or timeout. */
+/** Poll http://127.0.0.1:${BACKEND_PORT}/health until it returns 200 or timeout. */
 function waitForBackend(maxAttempts = 60) {
   return new Promise((resolve, reject) => {
     let attempts = 0;
     const check = () => {
-      const req = http.get("http://127.0.0.1:8000/health", (res) => {
+      const req = http.get("http://127.0.0.1:${BACKEND_PORT}/health", (res) => {
         if (res.statusCode === 200) {
           resolve();
         } else {
@@ -320,7 +329,7 @@ function createMainWindow() {
     backgroundColor: "#0f172a",
   });
 
-  const url = isDev() ? "http://127.0.0.1:5173/" : "http://127.0.0.1:8000/";
+  const url = isDev() ? DEV_UI_URL : PROD_URL;
   mainWindow.loadURL(url);
 
   mainWindow.once("ready-to-show", () => {
@@ -426,7 +435,7 @@ function buildMenu() {
         },
         {
           label: "API Docs",
-          click: () => shell.openExternal("http://127.0.0.1:8000/docs"),
+          click: () => shell.openExternal(`http://127.0.0.1:${BACKEND_PORT}/docs`),
         },
       ],
     },
@@ -447,7 +456,7 @@ app.whenReady().then(async () => {
     killBackend();
     dialog.showErrorBox(
       "Startup Failed",
-      `ScriptToVideo could not start:\n\n${err.message}\n\nCheck that no other app is using port 8000.`
+      `ScriptToVideo could not start:\n\n${err.message}\n\nCheck that no other app is using port ${BACKEND_PORT}.`
     );
     app.quit();
   }

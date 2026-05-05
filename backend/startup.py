@@ -91,10 +91,14 @@ if __name__ == "__main__":
     # Import app AFTER setting env vars so config picks them up
     from main import app  # noqa: F401
 
+    # Port: packaged app uses BACKEND_PORT env var (set by Electron to 8765)
+    # so it never conflicts with a dev server on 8000.
+    port = int(os.environ.get("BACKEND_PORT", 8000))
+
     uvicorn.run(
         "main:app",
         host="127.0.0.1",
-        port=8000,
+        port=port,
         log_level="info",
         # No --reload in packaged mode
         reload=False,
