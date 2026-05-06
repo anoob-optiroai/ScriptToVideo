@@ -307,6 +307,7 @@ function createSplash() {
   <h1>ScriptToVideo</h1>
   <p>Starting backend service…</p>
   <div class="dots"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>
+  <p style="font-size:11px;color:#64748b;margin-top:8px">First launch may take up to 2 minutes while Windows scans the app.</p>
 </body>
 </html>`);
 }
@@ -450,13 +451,19 @@ app.whenReady().then(async () => {
   startBackend();
 
   try {
-    await waitForBackend(isDev() ? 10 : 60);
+    await waitForBackend(isDev() ? 10 : 120);  // 120 s — antivirus may scan on first run
     createMainWindow();
   } catch (err) {
     killBackend();
+    const logPath = path.join(getUserDataPath(), "backend.log");
     dialog.showErrorBox(
       "Startup Failed",
-      `ScriptToVideo could not start:\n\n${err.message}\n\nCheck that no other app is using port ${BACKEND_PORT}.`
+      `ScriptToVideo could not start:\n\n` +
+      `${err.message}\n\n` +
+      `Common causes:\n` +
+      `• Windows Defender / antivirus blocked the backend (try adding an exception)\n` +
+      `• Port ${BACKEND_PORT} is in use by another app\n\n` +
+      `Diagnostic log:\n${logPath}`
     );
     app.quit();
   }
