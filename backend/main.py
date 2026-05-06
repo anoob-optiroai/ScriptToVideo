@@ -7,7 +7,8 @@ from fastapi.responses import FileResponse
 from pathlib import Path
 
 from config import settings
-from routers import audio, slides, merge, status, sync, project, settings
+from routers import audio, slides, merge, status, sync, project
+from routers import settings as settings_router
 
 app = FastAPI(
     title="ScriptToVideo API",
@@ -40,7 +41,7 @@ app.include_router(merge.router,  prefix="/api/merge",  tags=["Merge"])
 app.include_router(status.router, prefix="/api/status", tags=["Job Status"])
 app.include_router(sync.router,    prefix="/api/sync",    tags=["AI Sync"])
 app.include_router(project.router,   prefix="/api/project",  tags=["Project Save/Load"])
-app.include_router(settings.router,  prefix="/api/settings", tags=["Settings"])
+app.include_router(settings_router.router, prefix="/api/settings", tags=["Settings"])
 
 
 @app.get("/health")
