@@ -66,6 +66,8 @@ hidden_imports = [
     "requests", "urllib3",
     # aiofiles
     "aiofiles",
+    # PyMuPDF (fitz) — used for PDF-to-PNG slide rendering
+    "fitz", "pymupdf",
     # h11 (HTTP/1.1 parser used by uvicorn)
     "h11",
     # anyio (async backend used by FastAPI/Starlette)
