@@ -74,7 +74,7 @@ def convert_pptx_to_images(pptx_path: str, output_dir: str) -> list:
         pptx_path,
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)  # 10 min — large decks (100+ slides) can take several minutes
     except FileNotFoundError:
         raise RuntimeError(
             "LibreOffice is not installed on this computer.\n\n"
