@@ -47,11 +47,16 @@ def _setup_packaged_paths():
 
     # ── LibreOffice (check bundled, then well-known system locations) ─────────
     if sys.platform == "win32":
+        import glob as _glob
         lo_candidates = [
             bundle_dir / "LibreOffice" / "program" / "soffice.exe",
             Path("C:/Program Files/LibreOffice/program/soffice.exe"),
             Path("C:/Program Files (x86)/LibreOffice/program/soffice.exe"),
         ]
+        # Auto-detect any versioned LibreOffice (7.x, 24.x, 25.x, etc.)
+        for _base in ["C:/Program Files", "C:/Program Files (x86)"]:
+            for _p in _glob.glob(f"{_base}/LibreOffice*/program/soffice.exe"):
+                lo_candidates.append(Path(_p))
     elif sys.platform == "darwin":
         lo_candidates = [
             bundle_dir / "LibreOffice" / "program" / "soffice",

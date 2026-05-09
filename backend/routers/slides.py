@@ -23,26 +23,36 @@ router = APIRouter()
 def find_libreoffice() -> str:
     """Find the LibreOffice binary on the current system."""
     if settings.libreoffice_binary not in ("libreoffice", "soffice"):
-        return settings.libreoffice_binary
+        if os.path.exists(settings.libreoffice_binary):
+            return settings.libreoffice_binary
 
+    # Fixed known Windows paths
     windows_paths = [
         r"C:\Program Files\LibreOffice\program\soffice.exe",
         r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
-        r"C:\Program Files\LibreOffice 7\program\soffice.exe",
-        r"C:\Program Files\LibreOffice 24\program\soffice.exe",
     ]
+    # Also glob for any versioned install (LibreOffice 7, 24, 24.2, 25.x, etc.)
+    for base in [r"C:\Program Files", r"C:\Program Files (x86)"]:
+        windows_paths += glob.glob(os.path.join(base, "LibreOffice*", "program", "soffice.exe"))
+
     for path in windows_paths:
         if os.path.exists(path):
             return path
 
-    if shutil.which("soffice"):
-        return "soffice"
-    if shutil.which("libreoffice"):
-        return "libreoffice"
+    # Check system PATH as a last resort
+    which_soffice = shutil.which("soffice")
+    if which_soffice and os.path.exists(which_soffice):
+        return which_soffice
+    which_lo = shutil.which("libreoffice")
+    if which_lo and os.path.exists(which_lo):
+        return which_lo
 
     raise RuntimeError(
-        "LibreOffice not found. Please install it from https://www.libreoffice.org/download/ "
-        "and restart the backend."
+        "LibreOffice is not installed on this computer.\n\n"
+        "To use the PPTX converter, please:\n"
+        "1. Download LibreOffice from https://www.libreoffice.org/download/\n"
+        "2. Install it (keep the default installation path)\n"
+        "3. Restart ScriptToVideo"
     )
 
 
@@ -63,7 +73,16 @@ def convert_pptx_to_images(pptx_path: str, output_dir: str) -> list:
         "--outdir", output_dir,
         pptx_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except FileNotFoundError:
+        raise RuntimeError(
+            "LibreOffice is not installed on this computer.\n\n"
+            "To use the PPTX converter, please:\n"
+            "1. Download LibreOffice from https://www.libreoffice.org/download/\n"
+            "2. Install it (keep the default installation path)\n"
+            "3. Restart ScriptToVideo"
+        )
     if result.returncode != 0:
         raise RuntimeError(f"LibreOffice PDF export error: {result.stderr}")
 
