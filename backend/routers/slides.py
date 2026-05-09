@@ -66,15 +66,25 @@ def convert_pptx_to_images(pptx_path: str, output_dir: str) -> list:
 
     libreoffice_bin = find_libreoffice()
 
+    # Use a dedicated per-conversion user profile so headless LibreOffice never
+    # conflicts with a running GUI instance (which causes [WinError 2] / lock errors).
+    lo_profile_dir = os.path.join(output_dir, "_lo_profile")
+    os.makedirs(lo_profile_dir, exist_ok=True)
+    # LibreOffice expects a file:// URI for UserInstallation
+    lo_profile_uri = "file:///" + lo_profile_dir.replace("\\", "/").lstrip("/")
+
     cmd = [
         libreoffice_bin,
         "--headless",
+        "--norestore",           # don't try to restore a previous session
+        "--nofirststartwizard",  # skip first-run wizard
+        f"-env:UserInstallation={lo_profile_uri}",  # isolated profile per job
         "--convert-to", "pdf",
         "--outdir", output_dir,
         pptx_path,
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)  # 10 min — large decks (100+ slides) can take several minutes
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)  # 10 min for large decks
     except FileNotFoundError:
         raise RuntimeError(
             "LibreOffice is not installed on this computer.\n\n"
@@ -83,8 +93,14 @@ def convert_pptx_to_images(pptx_path: str, output_dir: str) -> list:
             "2. Install it (keep the default installation path)\n"
             "3. Restart ScriptToVideo"
         )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            "LibreOffice took longer than 10 minutes to convert the presentation. "
+            "Try splitting the file into smaller parts (50-60 slides each)."
+        )
     if result.returncode != 0:
-        raise RuntimeError(f"LibreOffice PDF export error: {result.stderr}")
+        stderr = (result.stderr or "").strip()
+        raise RuntimeError(f"LibreOffice PDF export failed (code {result.returncode}): {stderr}")
 
     pdf_files = glob.glob(os.path.join(output_dir, "*.pdf"))
     if not pdf_files:
