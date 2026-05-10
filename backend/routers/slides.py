@@ -1907,10 +1907,13 @@ def run_slides_to_video(
         import traceback
         tb = traceback.format_exc()
         print(f"[slides] ERROR in run_slides_to_video:\n{tb}")
-        # Include the last few lines of traceback in the UI error for diagnosis
+        # Extract frames from MY code (not Python internals) for diagnosis
         tb_lines = tb.strip().splitlines()
-        location = " | ".join(tb_lines[-4:]) if len(tb_lines) >= 4 else tb
-        job.update(error=f"{str(e)}\n\nLocation: {location}")
+        my_frames = [l.strip() for l in tb_lines
+                     if "File \"" in l and "subprocess.py" not in l
+                     and "site-packages" not in l and "_internal" not in l]
+        location = " | ".join(my_frames) if my_frames else " | ".join(tb_lines[-3:])
+        job.update(error=f"{str(e)}\n\nAt: {location}")
     finally:
         # Only clean up the uploaded PPTX — keep the frames directory
         if os.path.exists(pptx_path):

@@ -782,17 +782,27 @@ def run_sync_analysis(job_id: str, audio_filename: str, frames_job_id: str):
         client = OpenAI(api_key=settings.openai_api_key)
         file_size_mb = audio_path.stat().st_size / (1024 * 1024)
 
-        if file_size_mb > 24:
-            # Large file: compress to opus via ffmpeg before sending
+        # OpenAI Whisper limit: 25 MB. Compress any audio that might be close.
+        # At 16 kbps mono 16 kHz, even a 3-hour file stays ~21 MB.
+        if file_size_mb > 23:
             import subprocess, tempfile
-            job.update(progress=25, message="Audio is large — compressing for Whisper…")
+            job.update(progress=25, message=f"Audio is {file_size_mb:.0f} MB — compressing for Whisper (limit 25 MB)…")
             tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
             tmp.close()
-            subprocess.run([
+            r = subprocess.run([
                 settings.ffmpeg_binary, "-y", "-i", str(audio_path),
-                "-ar", "16000", "-ac", "1", "-b:a", "32k", tmp.name
+                "-ar", "16000", "-ac", "1", "-b:a", "16k", tmp.name
             ], capture_output=True, timeout=300)
-            whisper_path = tmp.name
+            compressed_mb = Path(tmp.name).stat().st_size / (1024 * 1024)
+            if r.returncode != 0 or compressed_mb < 0.01:
+                # Compression failed — try sending original and let Whisper reject if too big
+                try: os.remove(tmp.name)
+                except Exception: pass
+                tmp = None
+                whisper_path = str(audio_path)
+            else:
+                whisper_path = tmp.name
+                job.update(progress=30, message=f"Compressed to {compressed_mb:.1f} MB — sending to Whisper…")
         else:
             whisper_path = str(audio_path)
             tmp = None
