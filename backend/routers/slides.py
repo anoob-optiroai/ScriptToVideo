@@ -1253,19 +1253,48 @@ def _ffprobe_bin() -> str:
 
 
 def _get_video_duration(path: str) -> float:
-    """Return video duration in seconds using ffprobe."""
-    import json
+    """Return video duration in seconds.
+
+    Tries ffprobe first (JSON-exact); falls back to parsing ffmpeg -i stderr,
+    which is guaranteed available since ffmpeg is always bundled.
+    """
+    import json as _json
+    import shutil as _shutil
+    import re as _re
+
+    # ── 1. ffprobe (preferred — clean JSON output) ────────────────────────────
     ffprobe = _ffprobe_bin()
-    r = subprocess.run(
-        [ffprobe, "-v", "quiet", "-print_format", "json", "-show_streams", path],
-        capture_output=True, text=True, timeout=30,
+    # Verify the binary actually exists before calling it
+    ffprobe_ok = os.path.isfile(ffprobe) or (
+        os.sep not in ffprobe and "/" not in ffprobe and bool(_shutil.which(ffprobe))
     )
+    if ffprobe_ok:
+        try:
+            r = subprocess.run(
+                [ffprobe, "-v", "quiet", "-print_format", "json", "-show_streams", path],
+                capture_output=True, text=True, timeout=30,
+            )
+            for s in _json.loads(r.stdout or "{}").get("streams", []):
+                if "duration" in s:
+                    return float(s["duration"])
+        except Exception:
+            pass
+
+    # ── 2. ffmpeg -i fallback (always available since ffmpeg is bundled) ──────
     try:
-        for s in json.loads(r.stdout or "{}").get("streams", []):
-            if "duration" in s:
-                return float(s["duration"])
+        ffmpeg = settings.ffmpeg_binary
+        r = subprocess.run(
+            [ffmpeg, "-i", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        # ffmpeg prints "Duration: HH:MM:SS.cc" to stderr
+        m = _re.search(r"Duration:\s*(\d+):(\d+):([\d.]+)", r.stderr or "")
+        if m:
+            h, mi, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
+            return h * 3600 + mi * 60 + s
     except Exception:
         pass
+
     return 0.0
 
 

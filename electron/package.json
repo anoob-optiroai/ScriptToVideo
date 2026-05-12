@@ -1,6 +1,6 @@
 {
   "name": "scripttovideo",
-  "version": "1.1.8",
+  "version": "1.1.9",
   "description": "Convert PowerPoint slides with audio narration into synchronized MP4 videos",
   "main": "main.js",
   "author": "ScriptToVideo",

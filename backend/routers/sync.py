@@ -778,78 +778,147 @@ def run_sync_analysis(job_id: str, audio_filename: str, frames_job_id: str):
 
         job.update(progress=20, message=f"Transcribing audio with Whisper ({len(slide_texts)} slides)…")
 
-        # Transcribe — Whisper supports up to 25 MB.
-        # Use a 30-minute timeout: long audio (2-3 hrs) can take 10-20 min to transcribe.
         import httpx as _httpx
+        import subprocess as _sp
+        import tempfile as _tf
+        import re as _re
+
         client = OpenAI(
             api_key=settings.openai_api_key,
-            timeout=_httpx.Timeout(connect=10.0, read=1800.0, write=1800.0, pool=10.0),
+            # Per-chunk timeout: each 10-min chunk takes ≤ 3 min.  30 s connect.
+            timeout=_httpx.Timeout(connect=30.0, read=300.0, write=300.0, pool=10.0),
         )
-        file_size_mb = audio_path.stat().st_size / (1024 * 1024)
+        ffmpeg_bin = settings.ffmpeg_binary
 
-        # OpenAI Whisper limit: 25 MB. Compress any audio that might be close.
-        # At 16 kbps mono 16 kHz, even a 3-hour file stays ~18 MB.
-        if file_size_mb > 23:
-            import subprocess, tempfile
-            job.update(progress=25, message=f"Audio is {file_size_mb:.0f} MB — compressing for Whisper (limit 25 MB)…")
-            tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-            tmp.close()
-            r = subprocess.run([
-                settings.ffmpeg_binary, "-y", "-i", str(audio_path),
-                "-ar", "16000", "-ac", "1", "-b:a", "16k", tmp.name
-            ], capture_output=True, timeout=600)  # 10 min — 3-hr files need time
-            compressed_mb = Path(tmp.name).stat().st_size / (1024 * 1024)
-            if r.returncode != 0 or compressed_mb < 0.01:
-                # Compression failed — try sending original and let Whisper reject if too big
-                try: os.remove(tmp.name)
-                except Exception: pass
-                tmp = None
-                whisper_path = str(audio_path)
-            else:
-                whisper_path = tmp.name
-                job.update(progress=30, message=f"Compressed to {compressed_mb:.1f} MB — sending to Whisper (this may take 10-20 min for long audio)…")
-        else:
-            whisper_path = str(audio_path)
-            tmp = None
-
-        job.update(progress=35, message="Sending audio to Whisper API…")
-        with open(whisper_path, "rb") as f:
-            transcript = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                response_format="verbose_json",
-                timestamp_granularities=["word", "segment"],
-            )
-
-        if tmp:
+        # ── Measure real audio duration via ffmpeg -i ─────────────────────────
+        def _audio_duration_secs(p: str) -> float:
             try:
-                os.remove(whisper_path)
+                r2 = _sp.run([ffmpeg_bin, "-i", p], capture_output=True, text=True, timeout=30)
+                m2 = _re.search(r"Duration:\s*(\d+):(\d+):([\d.]+)", r2.stderr or "")
+                if m2:
+                    hh, mm, ss = int(m2.group(1)), int(m2.group(2)), float(m2.group(3))
+                    return hh * 3600 + mm * 60 + ss
             except Exception:
                 pass
+            return 0.0
+
+        audio_duration_secs = _audio_duration_secs(str(audio_path))
+        file_size_mb = audio_path.stat().st_size / (1024 * 1024)
+
+        # ── Chunked transcription helper ──────────────────────────────────────
+        # Cloudflare (in front of OpenAI) times out requests > ~5 min.
+        # At 32 kbps each 10-min chunk is ~2.4 MB, well under the 25 MB limit.
+        CHUNK_SECS = 600  # 10-minute chunks
+
+        def _transcribe_one(path: str) -> list:
+            """Transcribe a single file; return list of segment dicts."""
+            with open(path, "rb") as _f:
+                _tr = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=_f,
+                    response_format="verbose_json",
+                    timestamp_granularities=["word", "segment"],
+                )
+            _segs = []
+            for _s in (getattr(_tr, "segments", None) or []):
+                if isinstance(_s, dict):
+                    _segs.append(_s)
+                else:
+                    _d = {"text": _s.text, "start": float(_s.start), "end": float(_s.end)}
+                    _ws = getattr(_s, "words", None)
+                    if _ws:
+                        _d["words"] = [
+                            {"word": _w.word, "start": float(_w.start), "end": float(_w.end)}
+                            if not isinstance(_w, dict) else _w
+                            for _w in _ws
+                        ]
+                    _segs.append(_d)
+            return _segs
+
+        def _offset_segs(segs: list, offset: float) -> list:
+            """Add offset seconds to all start/end timestamps in segment list."""
+            out = []
+            for seg in segs:
+                d = dict(seg)
+                d["start"] = round(float(d.get("start", 0)) + offset, 3)
+                d["end"]   = round(float(d.get("end",   0)) + offset, 3)
+                if "words" in d:
+                    d["words"] = [
+                        {**w, "start": round(float(w.get("start", 0)) + offset, 3),
+                               "end":   round(float(w.get("end",   0)) + offset, 3)}
+                        for w in d["words"]
+                    ]
+                out.append(d)
+            return out
+
+        # Decide: chunk or single?
+        use_chunks = audio_duration_secs > CHUNK_SECS
+        n_chunks = max(1, int(audio_duration_secs / CHUNK_SECS) +
+                       (1 if audio_duration_secs % CHUNK_SECS > 0 else 0)) if use_chunks else 1
+
+        seg_dicts = []
+        total_duration = max(audio_duration_secs, 1.0)
+        tmp_files = []   # track temps for cleanup
+
+        try:
+            if not use_chunks:
+                # ── Short audio (≤ 10 min) — single call (original logic) ─────
+                # Compress if needed
+                if file_size_mb > 23:
+                    job.update(progress=25, message=f"Compressing audio ({file_size_mb:.0f} MB → target <23 MB)…")
+                    _tc = _tf.NamedTemporaryFile(suffix=".mp3", delete=False); _tc.close()
+                    tmp_files.append(_tc.name)
+                    _sp.run([ffmpeg_bin, "-y", "-i", str(audio_path),
+                             "-ar", "16000", "-ac", "1", "-b:a", "16k", _tc.name],
+                            capture_output=True, timeout=600, check=True)
+                    whisper_path = _tc.name
+                else:
+                    whisper_path = str(audio_path)
+                job.update(progress=35, message="Sending audio to Whisper API…")
+                seg_dicts = _transcribe_one(whisper_path)
+
+            else:
+                # ── Long audio — chunk into CHUNK_SECS segments ───────────────
+                job.update(progress=22, message=(
+                    f"Audio is {audio_duration_secs/3600:.1f} h — splitting into "
+                    f"{n_chunks} × 10-min chunks to avoid timeout…"
+                ))
+                for ci in range(n_chunks):
+                    chunk_start = ci * CHUNK_SECS
+                    chunk_dur   = min(CHUNK_SECS, audio_duration_secs - chunk_start)
+                    if chunk_dur <= 0:
+                        break
+
+                    pct = 22 + int(ci / n_chunks * 48)   # 22 % → 70 %
+                    job.update(progress=pct, message=(
+                        f"Transcribing chunk {ci + 1}/{n_chunks} "
+                        f"({chunk_start // 60:.0f}–{(chunk_start + chunk_dur) // 60:.0f} min)…"
+                    ))
+
+                    # Extract chunk at 32 kbps (~2.4 MB per 10 min)
+                    _tc = _tf.NamedTemporaryFile(suffix=".mp3", delete=False); _tc.close()
+                    tmp_files.append(_tc.name)
+                    _sp.run([
+                        ffmpeg_bin, "-y",
+                        "-ss", str(chunk_start), "-t", str(chunk_dur),
+                        "-i", str(audio_path),
+                        "-ar", "16000", "-ac", "1", "-b:a", "32k",
+                        _tc.name,
+                    ], capture_output=True, timeout=300, check=True)
+
+                    chunk_segs = _transcribe_one(_tc.name)
+                    seg_dicts.extend(_offset_segs(chunk_segs, chunk_start))
+
+        finally:
+            for _t in tmp_files:
+                try: os.remove(_t)
+                except Exception: pass
+
+        # total_duration: prefer last segment end-time (more accurate than ffmpeg for VBR)
+        if seg_dicts:
+            total_duration = max(total_duration, seg_dicts[-1]["end"])
 
         job.update(progress=70, message="Matching slide text to transcript…")
-
-        segments = getattr(transcript, "segments", None) or []
-        seg_dicts = []
-        for s in segments:
-            if isinstance(s, dict):
-                seg_dicts.append(s)
-            else:
-                d = {"text": s.text, "start": s.start, "end": s.end}
-                # Carry word-level timestamps through if Whisper returned them
-                words = getattr(s, "words", None)
-                if words:
-                    d["words"] = [
-                        {"word": w.word, "start": w.start, "end": w.end}
-                        if not isinstance(w, dict) else w
-                        for w in words
-                    ]
-                seg_dicts.append(d)
-
-        total_duration = float(
-            getattr(transcript, "duration", None) or
-            (seg_dicts[-1]["end"] if seg_dicts else 60.0)
-        )
 
         durations, debug_info, _timeline, _slide_start_idx = compute_slide_durations(
             slide_texts, seg_dicts, total_duration, slide_titles=slide_titles
