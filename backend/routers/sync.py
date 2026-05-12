@@ -778,12 +778,17 @@ def run_sync_analysis(job_id: str, audio_filename: str, frames_job_id: str):
 
         job.update(progress=20, message=f"Transcribing audio with Whisper ({len(slide_texts)} slides)…")
 
-        # Transcribe — Whisper supports up to 25 MB
-        client = OpenAI(api_key=settings.openai_api_key)
+        # Transcribe — Whisper supports up to 25 MB.
+        # Use a 30-minute timeout: long audio (2-3 hrs) can take 10-20 min to transcribe.
+        import httpx as _httpx
+        client = OpenAI(
+            api_key=settings.openai_api_key,
+            timeout=_httpx.Timeout(connect=10.0, read=1800.0, write=1800.0, pool=10.0),
+        )
         file_size_mb = audio_path.stat().st_size / (1024 * 1024)
 
         # OpenAI Whisper limit: 25 MB. Compress any audio that might be close.
-        # At 16 kbps mono 16 kHz, even a 3-hour file stays ~21 MB.
+        # At 16 kbps mono 16 kHz, even a 3-hour file stays ~18 MB.
         if file_size_mb > 23:
             import subprocess, tempfile
             job.update(progress=25, message=f"Audio is {file_size_mb:.0f} MB — compressing for Whisper (limit 25 MB)…")
@@ -792,7 +797,7 @@ def run_sync_analysis(job_id: str, audio_filename: str, frames_job_id: str):
             r = subprocess.run([
                 settings.ffmpeg_binary, "-y", "-i", str(audio_path),
                 "-ar", "16000", "-ac", "1", "-b:a", "16k", tmp.name
-            ], capture_output=True, timeout=300)
+            ], capture_output=True, timeout=600)  # 10 min — 3-hr files need time
             compressed_mb = Path(tmp.name).stat().st_size / (1024 * 1024)
             if r.returncode != 0 or compressed_mb < 0.01:
                 # Compression failed — try sending original and let Whisper reject if too big
@@ -802,7 +807,7 @@ def run_sync_analysis(job_id: str, audio_filename: str, frames_job_id: str):
                 whisper_path = str(audio_path)
             else:
                 whisper_path = tmp.name
-                job.update(progress=30, message=f"Compressed to {compressed_mb:.1f} MB — sending to Whisper…")
+                job.update(progress=30, message=f"Compressed to {compressed_mb:.1f} MB — sending to Whisper (this may take 10-20 min for long audio)…")
         else:
             whisper_path = str(audio_path)
             tmp = None
