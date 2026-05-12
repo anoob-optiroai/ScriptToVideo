@@ -1238,10 +1238,24 @@ def _concat_clips(clip_paths: list, abs_out: str):
         raise RuntimeError(f"FFmpeg concat error: {r.stderr[-300:]}")
 
 
+def _ffprobe_bin() -> str:
+    """Derive ffprobe path from the ffmpeg binary — handles bundled full-path correctly."""
+    ffmpeg = settings.ffmpeg_binary
+    ffprobe_name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+    # If it's a full path, swap only the filename (not the directory name)
+    if os.sep in ffmpeg or "/" in ffmpeg:
+        candidate = os.path.join(os.path.dirname(ffmpeg), ffprobe_name)
+        if os.path.exists(candidate):
+            return candidate
+    # Fallback: try PATH
+    import shutil
+    return shutil.which("ffprobe") or ffprobe_name
+
+
 def _get_video_duration(path: str) -> float:
     """Return video duration in seconds using ffprobe."""
     import json
-    ffprobe = settings.ffmpeg_binary.replace("ffmpeg", "ffprobe").replace("ffmpeg.exe", "ffprobe.exe")
+    ffprobe = _ffprobe_bin()
     r = subprocess.run(
         [ffprobe, "-v", "quiet", "-print_format", "json", "-show_streams", path],
         capture_output=True, text=True, timeout=30,
