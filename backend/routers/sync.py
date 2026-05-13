@@ -965,7 +965,7 @@ def run_sync_analysis(job_id: str, audio_filename: str, frames_job_id: str):
                 "slide_durations": durations,
                 "total_duration": round(total_duration, 2),
                 "slide_count": len(durations),
-                "transcript_preview": (getattr(transcript, "text", "") or "")[:300],
+                "transcript_preview": " ".join(s.get("text", "") for s in seg_dicts)[:300],
                 "debug": debug_info,
             },
         )
