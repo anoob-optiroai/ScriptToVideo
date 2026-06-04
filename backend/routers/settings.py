@@ -64,6 +64,7 @@ class SettingsResponse(BaseModel):
     elevenlabs_api_key: str
     openai_api_key: str
     google_cloud_api_key: str
+    gemini_api_key: str
     google_docs_api_key: str
     env_file_path: str
     is_configured: bool   # True if at least one TTS key is set
@@ -74,6 +75,7 @@ class SettingsUpdate(BaseModel):
     elevenlabs_api_key: Optional[str] = None
     openai_api_key: Optional[str] = None
     google_cloud_api_key: Optional[str] = None
+    gemini_api_key: Optional[str] = None
     google_docs_api_key: Optional[str] = None
 
 
@@ -92,6 +94,7 @@ def get_settings():
     el_key = env.get("ELEVENLABS_API_KEY", "")
     oa_key = env.get("OPENAI_API_KEY", "")
     gc_key = env.get("GOOGLE_CLOUD_API_KEY", "")
+    gm_key = env.get("GEMINI_API_KEY", "")
 
     try:
         env_path = str(_env_path())
@@ -103,9 +106,10 @@ def get_settings():
         elevenlabs_api_key=mask(el_key),
         openai_api_key=mask(oa_key),
         google_cloud_api_key=mask(gc_key),
+        gemini_api_key=mask(gm_key),
         google_docs_api_key=mask(env.get("GOOGLE_DOCS_API_KEY", "")),
         env_file_path=env_path,
-        is_configured=bool(el_key or oa_key or gc_key),
+        is_configured=bool(el_key or oa_key or gc_key or gm_key),
     )
 
 
@@ -122,6 +126,7 @@ def update_settings(body: SettingsUpdate):
         "elevenlabs_api_key":  ("ELEVENLABS_API_KEY",    body.elevenlabs_api_key),
         "openai_api_key":      ("OPENAI_API_KEY",         body.openai_api_key),
         "google_cloud_api_key":("GOOGLE_CLOUD_API_KEY",  body.google_cloud_api_key),
+        "gemini_api_key":      ("GEMINI_API_KEY",         body.gemini_api_key),
         "google_docs_api_key": ("GOOGLE_DOCS_API_KEY",   body.google_docs_api_key),
     }
 

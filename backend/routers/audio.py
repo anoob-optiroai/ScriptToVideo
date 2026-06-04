@@ -32,6 +32,46 @@ GOOGLE_VOICES = [
     {"id": "en-AU", "name": "English (Australia)"},
 ]
 
+# Full Gemini TTS voice list (gemini-2.5-flash-preview-tts)
+# Organised: Neutral/Male/Female with character descriptions
+GEMINI_VOICES = [
+    # ── Bright / Upbeat ──────────────────────────────────────────────────────
+    {"id": "Zephyr",       "name": "Zephyr — Bright"},
+    {"id": "Puck",         "name": "Puck — Upbeat"},
+    {"id": "Leda",         "name": "Leda — Youthful"},
+    {"id": "Autonoe",      "name": "Autonoe — Bright"},
+    {"id": "Laomedeia",    "name": "Laomedeia — Upbeat"},
+    {"id": "Sadachbia",    "name": "Sadachbia — Lively"},
+    # ── Calm / Easy-going ────────────────────────────────────────────────────
+    {"id": "Aoede",        "name": "Aoede — Breezy"},
+    {"id": "Callirrhoe",   "name": "Callirrhoe — Easy-going"},
+    {"id": "Umbriel",      "name": "Umbriel — Easy-going"},
+    {"id": "Zubenelgenubi","name": "Zubenelgenubi — Casual"},
+    {"id": "Vindemiatrix", "name": "Vindemiatrix — Gentle"},
+    {"id": "Sulafat",      "name": "Sulafat — Warm"},
+    {"id": "Achird",       "name": "Achird — Friendly"},
+    # ── Informative / Clear ───────────────────────────────────────────────────
+    {"id": "Charon",       "name": "Charon — Informative"},
+    {"id": "Rasalgethi",   "name": "Rasalgethi — Informative"},
+    {"id": "Iapetus",      "name": "Iapetus — Clear"},
+    {"id": "Erinome",      "name": "Erinome — Clear"},
+    {"id": "Sadaltager",   "name": "Sadaltager — Knowledgeable"},
+    # ── Firm / Authoritative ─────────────────────────────────────────────────
+    {"id": "Kore",         "name": "Kore — Firm"},
+    {"id": "Orus",         "name": "Orus — Firm"},
+    {"id": "Alnilam",      "name": "Alnilam — Firm"},
+    {"id": "Fenrir",       "name": "Fenrir — Excitable"},
+    {"id": "Pulcherrima",  "name": "Pulcherrima — Forward"},
+    # ── Smooth / Deep ─────────────────────────────────────────────────────────
+    {"id": "Algieba",      "name": "Algieba — Smooth"},
+    {"id": "Despina",      "name": "Despina — Smooth"},
+    {"id": "Algenib",      "name": "Algenib — Gravelly"},
+    {"id": "Gacrux",       "name": "Gacrux — Mature"},
+    {"id": "Schedar",      "name": "Schedar — Even"},
+    {"id": "Achernar",     "name": "Achernar — Soft"},
+    {"id": "Enceladus",    "name": "Enceladus — Breathy"},
+]
+
 
 def fetch_elevenlabs_voices():
     """Fetch real voices from the user's ElevenLabs account dynamically."""
@@ -67,6 +107,8 @@ def get_audio_config():
         voices = OPENAI_VOICES
     elif provider == "google":
         voices = GOOGLE_VOICES
+    elif provider == "gemini":
+        voices = GEMINI_VOICES
     else:
         voices = OPENAI_VOICES
 
@@ -274,6 +316,98 @@ def tts_google(text: str, language_code: str, output_path: str):
         f.write(response.audio_content)
 
 
+def tts_gemini_chunk(text: str, voice: str, output_path: str, api_key: str):
+    """
+    Generate one chunk of audio via Google Gemini TTS API.
+    The API returns raw 24 kHz / 16-bit / mono PCM; we pipe it through
+    ffmpeg to produce a standard MP3 file.
+    """
+    import base64
+    import subprocess
+    import tempfile
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=api_key)
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash-preview-tts",
+        contents=text,
+        config=types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name=voice,
+                    )
+                )
+            ),
+        ),
+    )
+
+    part = response.candidates[0].content.parts[0]
+    audio_data = part.inline_data.data
+    # Gemini may return bytes or a base64 string depending on SDK version
+    if isinstance(audio_data, str):
+        audio_data = base64.b64decode(audio_data)
+
+    # Write raw PCM to a temp file, then convert to MP3 via ffmpeg
+    tmp = tempfile.NamedTemporaryFile(suffix=".pcm", delete=False)
+    tmp.write(audio_data)
+    tmp.close()
+    try:
+        result = subprocess.run(
+            [
+                settings.ffmpeg_binary, "-y",
+                "-f", "s16le",   # signed 16-bit little-endian PCM
+                "-ar", "24000",  # 24 kHz sample rate (Gemini output)
+                "-ac", "1",      # mono
+                "-i", tmp.name,
+                "-codec:a", "libmp3lame", "-q:a", "2",
+                output_path,
+            ],
+            capture_output=True, timeout=120,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg PCM→MP3 failed: {result.stderr[-300:]}"
+            )
+    finally:
+        try:
+            os.remove(tmp.name)
+        except Exception:
+            pass
+
+
+def tts_gemini(text: str, voice: str, output_path: str, api_key: str, job=None):
+    """
+    Split long scripts into ~4 500-char chunks and concatenate.
+    Gemini TTS handles up to ~5 000 chars per request.
+    """
+    chunks = split_text_into_chunks(text, max_chars=4500)
+    if len(chunks) == 1:
+        tts_gemini_chunk(chunks[0], voice, output_path, api_key)
+        return
+
+    chunk_paths = []
+    base = output_path.replace(".mp3", "")
+    for i, chunk in enumerate(chunks):
+        if job:
+            pct = 30 + int((i / len(chunks)) * 60)
+            job.update(progress=pct, message=f"Generating audio part {i + 1} of {len(chunks)}…")
+        chunk_path = f"{base}_part{i}.mp3"
+        tts_gemini_chunk(chunk, voice, chunk_path, api_key)
+        chunk_paths.append(chunk_path)
+
+    concatenate_audio_files(chunk_paths, output_path)
+
+    for p in chunk_paths:
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+
+
 # ── Background worker ────────────────────────────────────────────────────────
 
 def run_audio_generation(job_id: str, text: str, voice: str, speed: float, language: str):
@@ -294,6 +428,11 @@ def run_audio_generation(job_id: str, text: str, voice: str, speed: float, langu
             tts_openai(text, openai_voice, output_path, speed, job=job)
         elif provider == "google":
             tts_google(text, language, output_path)
+        elif provider == "gemini":
+            if not settings.gemini_api_key:
+                raise ValueError("Gemini API key not set. Add it in Settings.")
+            gemini_voice = voice if voice else "Charon"
+            tts_gemini(text, gemini_voice, output_path, settings.gemini_api_key, job=job)
         else:
             raise ValueError(f"Unknown TTS provider: {provider}")
 

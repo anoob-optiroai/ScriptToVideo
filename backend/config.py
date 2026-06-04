@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     elevenlabs_api_key: str = ""
     openai_api_key: str = ""
     google_cloud_api_key: str = ""
+    gemini_api_key: str = ""
 
     # Google Docs API (for importing from Google Docs URLs)
     google_docs_api_key: str = ""

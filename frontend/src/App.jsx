@@ -53,8 +53,9 @@ function ProviderBadge({ provider }) {
     elevenlabs: "bg-yellow-500/20 text-yellow-300 border-yellow-500/40",
     openai:     "bg-green-500/20 text-green-300 border-green-500/40",
     google:     "bg-blue-500/20 text-blue-300 border-blue-500/40",
+    gemini:     "bg-purple-500/20 text-purple-300 border-purple-500/40",
   };
-  const labels = { elevenlabs: "ElevenLabs", openai: "OpenAI TTS", google: "Google TTS" };
+  const labels = { elevenlabs: "ElevenLabs", openai: "OpenAI TTS", google: "Google TTS", gemini: "Gemini TTS" };
   return (
     <span className={`text-xs px-2 py-0.5 rounded-full border font-medium ${colors[provider] || "bg-slate-700 text-slate-300 border-slate-600"}`}>
       {labels[provider] || provider}
@@ -64,7 +65,7 @@ function ProviderBadge({ provider }) {
 
 // ── Settings Modal ────────────────────────────────────────────────────────────
 function SettingsModal({ onClose, onSaved }) {
-  const [form, setForm] = useState({ tts_provider: "elevenlabs", elevenlabs_api_key: "", openai_api_key: "", google_cloud_api_key: "", google_docs_api_key: "" });
+  const [form, setForm] = useState({ tts_provider: "elevenlabs", elevenlabs_api_key: "", openai_api_key: "", google_cloud_api_key: "", gemini_api_key: "", google_docs_api_key: "" });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState("");
@@ -73,7 +74,7 @@ function SettingsModal({ onClose, onSaved }) {
   useEffect(() => {
     fetch(`${API_BASE}/api/settings`)
       .then(r => r.json())
-      .then(d => { setForm(f => ({ ...f, tts_provider: d.tts_provider || "elevenlabs" })); setLoading(false); })
+      .then(d => { setForm(f => ({ ...f, tts_provider: d.tts_provider || "elevenlabs", gemini_api_key: d.gemini_api_key || "" })); setLoading(false); })
       .catch(() => setLoading(false));
   }, []);
 
@@ -83,6 +84,7 @@ function SettingsModal({ onClose, onSaved }) {
     if (form.elevenlabs_api_key && !form.elevenlabs_api_key.includes("*")) body.elevenlabs_api_key = form.elevenlabs_api_key;
     if (form.openai_api_key && !form.openai_api_key.includes("*")) body.openai_api_key = form.openai_api_key;
     if (form.google_cloud_api_key && !form.google_cloud_api_key.includes("*")) body.google_cloud_api_key = form.google_cloud_api_key;
+    if (form.gemini_api_key && !form.gemini_api_key.includes("*")) body.gemini_api_key = form.gemini_api_key;
     if (form.google_docs_api_key && !form.google_docs_api_key.includes("*")) body.google_docs_api_key = form.google_docs_api_key;
     try {
       const r = await fetch(`${API_BASE}/api/settings`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -124,10 +126,15 @@ function SettingsModal({ onClose, onSaved }) {
             {/* TTS Provider */}
             <div>
               <label className="block text-xs text-slate-400 mb-2">TTS Provider</label>
-              <div className="flex gap-2">
-                {[["elevenlabs","ElevenLabs"],["openai","OpenAI"],["google","Google"]].map(([v,l]) => (
+              <div className="grid grid-cols-2 gap-2">
+                {[
+                  ["gemini",     "✨ Gemini TTS",  "bg-purple-600 border-purple-500"],
+                  ["elevenlabs", "ElevenLabs",      "bg-indigo-600 border-indigo-500"],
+                  ["openai",     "OpenAI TTS",      "bg-indigo-600 border-indigo-500"],
+                  ["google",     "Google TTS",      "bg-indigo-600 border-indigo-500"],
+                ].map(([v, l, activeClass]) => (
                   <button key={v} onClick={() => setForm(f => ({ ...f, tts_provider: v }))}
-                    className={`flex-1 py-2 rounded-lg text-xs font-medium border transition-colors ${form.tts_provider === v ? "bg-indigo-600 border-indigo-500 text-white" : "bg-slate-700 border-slate-600 text-slate-300 hover:border-slate-500"}`}>
+                    className={`py-2 rounded-lg text-xs font-medium border transition-colors ${form.tts_provider === v ? `${activeClass} text-white` : "bg-slate-700 border-slate-600 text-slate-300 hover:border-slate-500"}`}>
                     {l}
                   </button>
                 ))}
@@ -141,6 +148,8 @@ function SettingsModal({ onClose, onSaved }) {
                   {showKeys ? "Hide" : "Show"} keys
                 </button>
               </div>
+              <Field label="✨ Gemini API Key" field="gemini_api_key" placeholder="AIza..."
+                hint={form.tts_provider === "gemini" ? "Required — get from aistudio.google.com/apikey" : "For Gemini TTS (aistudio.google.com/apikey)"} />
               <Field label="ElevenLabs API Key" field="elevenlabs_api_key" placeholder="sk_..." hint={form.tts_provider === "elevenlabs" ? "Required for current provider" : ""} />
               <Field label="OpenAI API Key" field="openai_api_key" placeholder="sk-proj-..." hint={form.tts_provider === "openai" ? "Required for current provider" : ""} />
               <Field label="Google Cloud API Key" field="google_cloud_api_key" placeholder="AIza..." hint={form.tts_provider === "google" ? "Required for current provider" : ""} />
@@ -212,7 +221,7 @@ function AudioModal({ onClose, onDone }) {
   };
 
   const isElevenLabs = config?.provider === "elevenlabs";
-  const providerLabel = config?.provider === "elevenlabs" ? "ElevenLabs" : config?.provider === "openai" ? "OpenAI" : "Google";
+  const providerLabel = { elevenlabs: "ElevenLabs", openai: "OpenAI", google: "Google", gemini: "Gemini" }[config?.provider] ?? config?.provider ?? "";
 
   return (
     <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
