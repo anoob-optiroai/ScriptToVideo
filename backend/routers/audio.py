@@ -316,34 +316,68 @@ def tts_google(text: str, language_code: str, output_path: str):
         f.write(response.audio_content)
 
 
+def _sanitize_for_tts(text: str) -> str:
+    """
+    Strip characters that can cause Gemini TTS 500 errors:
+    control characters, null bytes, excessive whitespace.
+    """
+    import unicodedata
+    # Remove ASCII control chars (except tab, newline, carriage return)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cc" or ch in "\t\n\r")
+    # Collapse runs of whitespace / newlines into a single space
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def tts_gemini_chunk(text: str, voice: str, output_path: str, api_key: str):
     """
     Generate one chunk of audio via Google Gemini TTS API.
     The API returns raw 24 kHz / 16-bit / mono PCM; we pipe it through
     ffmpeg to produce a standard MP3 file.
+    Retries up to 3 times with exponential back-off on transient 500 errors.
     """
     import base64
     import subprocess
     import tempfile
+    import time
     from google import genai
     from google.genai import types
 
     client = genai.Client(api_key=api_key)
+    clean_text = _sanitize_for_tts(text)
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash-preview-tts",
-        contents=text,
-        config=types.GenerateContentConfig(
-            response_modalities=["AUDIO"],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name=voice,
-                    )
-                )
-            ),
-        ),
-    )
+    last_exc = None
+    for attempt in range(3):            # try up to 3 times
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash-preview-tts",
+                contents=clean_text,
+                config=types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                voice_name=voice,
+                            )
+                        )
+                    ),
+                ),
+            )
+            break                       # success — exit retry loop
+        except Exception as exc:
+            last_exc = exc
+            err_str = str(exc)
+            # Only retry on 500/503 server-side errors; raise immediately otherwise
+            if "500" not in err_str and "503" not in err_str and "INTERNAL" not in err_str:
+                raise
+            if attempt < 2:
+                wait = 2 ** attempt     # 1 s, 2 s
+                time.sleep(wait)
+    else:
+        raise RuntimeError(
+            f"Gemini TTS failed after 3 attempts: {last_exc}"
+        )
 
     part = response.candidates[0].content.parts[0]
     audio_data = part.inline_data.data
@@ -381,10 +415,11 @@ def tts_gemini_chunk(text: str, voice: str, output_path: str, api_key: str):
 
 def tts_gemini(text: str, voice: str, output_path: str, api_key: str, job=None):
     """
-    Split long scripts into ~4 500-char chunks and concatenate.
-    Gemini TTS handles up to ~5 000 chars per request.
+    Split long scripts into ~8 000-char chunks and concatenate.
+    Gemini TTS handles up to ~10 000 chars per request; 8 000 gives a safe margin.
+    Fewer chunks = fewer seams = more consistent pacing across the full audio.
     """
-    chunks = split_text_into_chunks(text, max_chars=4500)
+    chunks = split_text_into_chunks(text, max_chars=8000)
     if len(chunks) == 1:
         tts_gemini_chunk(chunks[0], voice, output_path, api_key)
         return
