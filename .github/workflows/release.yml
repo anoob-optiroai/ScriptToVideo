@@ -66,7 +66,7 @@ jobs:
   # ── macOS .dmg ────────────────────────────────────────────────────────────────
   build-mac:
     name: macOS DMG
-    runs-on: macos-13          # last Intel x64 runner (stable DMG support)
+    runs-on: macos-latest      # Apple Silicon M1 — most available Mac runner
     needs: build-windows       # run after Windows so the release already exists
 
     steps:
@@ -104,19 +104,13 @@ jobs:
           npm ci
           npm run build
 
-      - name: Download FFmpeg + FFprobe (macOS x64)
+      - name: Install FFmpeg + FFprobe via Homebrew (native ARM64)
         run: |
+          brew install ffmpeg
           mkdir -p ffmpeg_bin
-          # ffmpeg
-          curl -fsSL "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip" -o /tmp/ffmpeg.zip
-          unzip -o /tmp/ffmpeg.zip -d /tmp/ffmpeg_mac/
-          cp /tmp/ffmpeg_mac/ffmpeg ffmpeg_bin/ffmpeg
-          chmod +x ffmpeg_bin/ffmpeg
-          # ffprobe
-          curl -fsSL "https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip" -o /tmp/ffprobe.zip
-          unzip -o /tmp/ffprobe.zip -d /tmp/ffprobe_mac/
-          cp /tmp/ffprobe_mac/ffprobe ffmpeg_bin/ffprobe
-          chmod +x ffmpeg_bin/ffprobe
+          cp "$(which ffmpeg)"  ffmpeg_bin/ffmpeg
+          cp "$(which ffprobe)" ffmpeg_bin/ffprobe
+          chmod +x ffmpeg_bin/ffmpeg ffmpeg_bin/ffprobe
           echo "ffmpeg:  $(ffmpeg_bin/ffmpeg  -version 2>&1 | head -1)"
           echo "ffprobe: $(ffmpeg_bin/ffprobe -version 2>&1 | head -1)"
 
@@ -127,11 +121,11 @@ jobs:
           pip3 install pyinstaller -q
           pyinstaller scriptovideo.spec --noconfirm
 
-      - name: Build & publish macOS DMG
+      - name: Build & publish macOS DMG (arm64)
         working-directory: electron
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
           CSC_IDENTITY_AUTO_DISCOVERY: "false"   # skip code signing (no Apple cert)
         run: |
           npm ci
-          npx electron-builder --mac --publish always
+          npx electron-builder --mac --arm64 --publish always
