@@ -413,19 +413,45 @@ def tts_gemini_chunk(text: str, voice: str, output_path: str, api_key: str):
             pass
 
 
+def _generate_silence_mp3(output_path: str, duration_sec: float = 0.4):
+    """
+    Write a short silent MP3 (mono 24 kHz) using ffmpeg lavfi.
+    Used as a natural breath-gap between Gemini TTS chunks to reset pacing.
+    """
+    import subprocess
+    subprocess.run(
+        [
+            settings.ffmpeg_binary, "-y",
+            "-f", "lavfi",
+            "-i", f"anullsrc=channel_layout=mono:sample_rate=24000",
+            "-t", str(duration_sec),
+            "-codec:a", "libmp3lame", "-q:a", "2",
+            output_path,
+        ],
+        capture_output=True, timeout=30,
+    )
+
+
 def tts_gemini(text: str, voice: str, output_path: str, api_key: str, job=None):
     """
-    Split long scripts into ~8 000-char chunks and concatenate.
-    Gemini TTS handles up to ~10 000 chars per request; 8 000 gives a safe margin.
-    Fewer chunks = fewer seams = more consistent pacing across the full audio.
+    Split script into ~2 500-char paragraph-aware chunks and concatenate.
+
+    Why 2 500 chars?  Gemini TTS gradually accelerates within a single request
+    as the text gets longer.  Shorter chunks keep each call brief so the model
+    finishes before it has a chance to speed up.  A 400 ms silence is inserted
+    between chunks to give a natural breath-gap and avoid the chunks sounding
+    like they're running together.
     """
-    chunks = split_text_into_chunks(text, max_chars=8000)
+    chunks = split_text_into_chunks(text, max_chars=2500)
     if len(chunks) == 1:
         tts_gemini_chunk(chunks[0], voice, output_path, api_key)
         return
 
-    chunk_paths = []
     base = output_path.replace(".mp3", "")
+    silence_path = f"{base}_silence.mp3"
+    _generate_silence_mp3(silence_path, duration_sec=0.4)
+
+    chunk_paths = []
     for i, chunk in enumerate(chunks):
         if job:
             pct = 30 + int((i / len(chunks)) * 60)
@@ -434,13 +460,24 @@ def tts_gemini(text: str, voice: str, output_path: str, api_key: str, job=None):
         tts_gemini_chunk(chunk, voice, chunk_path, api_key)
         chunk_paths.append(chunk_path)
 
-    concatenate_audio_files(chunk_paths, output_path)
+    # Interleave silence between chunks: [c0, sil, c1, sil, c2, ...]
+    interleaved = []
+    for i, p in enumerate(chunk_paths):
+        interleaved.append(p)
+        if i < len(chunk_paths) - 1:
+            interleaved.append(silence_path)
+
+    concatenate_audio_files(interleaved, output_path)
 
     for p in chunk_paths:
         try:
             os.remove(p)
         except Exception:
             pass
+    try:
+        os.remove(silence_path)
+    except Exception:
+        pass
 
 
 # ── Background worker ────────────────────────────────────────────────────────
