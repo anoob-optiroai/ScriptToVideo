@@ -73,8 +73,15 @@ GEMINI_VOICES = [
 ]
 
 
+ELEVENLABS_MODELS = [
+    {"id": "eleven_multilingual_v2", "name": "Multilingual v2 — High Quality",  "cost": "$0.10/1K chars"},
+    {"id": "eleven_flash_v2_5",      "name": "Flash v2.5 — Fast & Cheap",        "cost": "$0.05/1K chars"},
+    {"id": "eleven_turbo_v2_5",      "name": "Turbo v2.5 — Balanced",            "cost": "$0.05/1K chars"},
+]
+
+
 def fetch_elevenlabs_voices():
-    """Fetch real voices from the user's ElevenLabs account dynamically."""
+    """Fetch voices from the user's ElevenLabs account, including preview URLs."""
     import requests
     try:
         response = requests.get(
@@ -90,15 +97,19 @@ def fetch_elevenlabs_voices():
             category = v.get("category", "")
             if category:
                 label = f"{label} ({category})"
-            voices.append({"id": v["voice_id"], "name": label})
-        return voices if voices else [{"id": "", "name": "No voices found"}]
+            voices.append({
+                "id":          v["voice_id"],
+                "name":        label,
+                "preview_url": v.get("preview_url", ""),
+            })
+        return voices if voices else [{"id": "", "name": "No voices found", "preview_url": ""}]
     except Exception as e:
-        return [{"id": "", "name": f"Could not load voices: {e}"}]
+        return [{"id": "", "name": f"Could not load voices: {e}", "preview_url": ""}]
 
 
 @router.get("/config")
 def get_audio_config():
-    """Return the current TTS provider and available voices for the UI."""
+    """Return the current TTS provider, voices (with preview URLs), and available models."""
     provider = settings.tts_provider.lower()
 
     if provider == "elevenlabs":
@@ -112,10 +123,15 @@ def get_audio_config():
     else:
         voices = OPENAI_VOICES
 
+    models        = ELEVENLABS_MODELS if provider == "elevenlabs" else []
+    default_model = ELEVENLABS_MODELS[0]["id"] if provider == "elevenlabs" else ""
+
     return {
-        "provider": provider,
-        "voices": voices,
+        "provider":      provider,
+        "voices":        voices,
         "default_voice": voices[0]["id"] if voices else "",
+        "models":        models,
+        "default_model": default_model,
     }
 
 
@@ -206,7 +222,8 @@ def concatenate_audio_files(chunk_paths: list, output_path: str):
 
 # ── TTS providers ────────────────────────────────────────────────────────────
 
-def tts_elevenlabs_chunk(text: str, voice_id: str, output_path: str):
+def tts_elevenlabs_chunk(text: str, voice_id: str, output_path: str,
+                         model: str = "eleven_multilingual_v2"):
     """Send one chunk to ElevenLabs (max 9500 chars)."""
     import requests
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
@@ -216,7 +233,7 @@ def tts_elevenlabs_chunk(text: str, voice_id: str, output_path: str):
     }
     payload = {
         "text": text,
-        "model_id": "eleven_multilingual_v2",
+        "model_id": model,
         "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
     }
     response = requests.post(url, json=payload, headers=headers, timeout=120)
@@ -231,11 +248,12 @@ def tts_elevenlabs_chunk(text: str, voice_id: str, output_path: str):
         f.write(response.content)
 
 
-def tts_elevenlabs(text: str, voice_id: str, output_path: str, job=None):
+def tts_elevenlabs(text: str, voice_id: str, output_path: str, job=None,
+                   model: str = "eleven_multilingual_v2"):
     """Split long text into chunks and concatenate audio output."""
     chunks = split_text_into_chunks(text, max_chars=9500)
     if len(chunks) == 1:
-        tts_elevenlabs_chunk(chunks[0], voice_id, output_path)
+        tts_elevenlabs_chunk(chunks[0], voice_id, output_path, model)
         return
 
     chunk_paths = []
@@ -245,12 +263,11 @@ def tts_elevenlabs(text: str, voice_id: str, output_path: str, job=None):
             pct = 30 + int((i / len(chunks)) * 60)
             job.update(progress=pct, message=f"Generating audio part {i+1} of {len(chunks)}...")
         chunk_path = f"{base}_part{i}.mp3"
-        tts_elevenlabs_chunk(chunk, voice_id, chunk_path)
+        tts_elevenlabs_chunk(chunk, voice_id, chunk_path, model)
         chunk_paths.append(chunk_path)
 
     concatenate_audio_files(chunk_paths, output_path)
 
-    # Clean up chunk files
     for p in chunk_paths:
         try:
             os.remove(p)
@@ -482,7 +499,8 @@ def tts_gemini(text: str, voice: str, output_path: str, api_key: str, job=None):
 
 # ── Background worker ────────────────────────────────────────────────────────
 
-def run_audio_generation(job_id: str, text: str, voice: str, speed: float, language: str):
+def run_audio_generation(job_id: str, text: str, voice: str, speed: float, language: str,
+                         model: str = "eleven_multilingual_v2"):
     job = job_store.get(job_id)
     try:
         job.update(status="processing", progress=10, message="Preparing text...")
@@ -494,7 +512,7 @@ def run_audio_generation(job_id: str, text: str, voice: str, speed: float, langu
         job.update(progress=30, message=f"Generating audio with {provider}...")
 
         if provider == "elevenlabs":
-            tts_elevenlabs(text, voice, output_path, job=job)
+            tts_elevenlabs(text, voice, output_path, job=job, model=model)
         elif provider == "openai":
             openai_voice = voice if voice else "alloy"
             tts_openai(text, openai_voice, output_path, speed, job=job)
@@ -582,6 +600,7 @@ async def generate_audio(
     voice: Optional[str] = Form(None),
     speed: Optional[float] = Form(1.0),
     language: Optional[str] = Form("en-US"),
+    model: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
 ):
     script_text = None
@@ -608,7 +627,8 @@ async def generate_audio(
     if not script_text:
         raise HTTPException(status_code=400, detail="No script text provided.")
 
+    el_model = model or "eleven_multilingual_v2"
     job = job_store.create()
-    background_tasks.add_task(run_audio_generation, job.job_id, script_text, voice, speed, language)
+    background_tasks.add_task(run_audio_generation, job.job_id, script_text, voice, speed, language, el_model)
 
     return {"job_id": job.job_id, "status": "pending"}

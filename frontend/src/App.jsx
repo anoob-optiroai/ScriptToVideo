@@ -182,20 +182,51 @@ function AudioModal({ onClose, onDone }) {
   const [url, setUrl] = useState("");
   const [file, setFile] = useState(null);
   const [voice, setVoice] = useState("");
+  const [model, setModel] = useState("eleven_multilingual_v2");
   const [speed, setSpeed] = useState(1.0);
   const [progress, setProgress] = useState(0);
   const [message, setMessage] = useState("");
   const [running, setRunning] = useState(false);
   const [error, setError] = useState("");
   const [config, setConfig] = useState(null);
+  const [playingPreview, setPlayingPreview] = useState(false);
+  const previewAudioRef = useRef(null);
   const fileRef = useRef();
 
   useEffect(() => {
     fetch(`${API_BASE}/api/audio/config`)
       .then(r => r.json())
-      .then(data => { setConfig(data); setVoice(data.default_voice || ""); })
-      .catch(() => setConfig({ provider: "unknown", voices: [], default_voice: "" }));
+      .then(data => {
+        setConfig(data);
+        setVoice(data.default_voice || "");
+        if (data.default_model) setModel(data.default_model);
+      })
+      .catch(() => setConfig({ provider: "unknown", voices: [], default_voice: "", models: [] }));
   }, []);
+
+  // Stop preview when voice changes
+  useEffect(() => {
+    if (previewAudioRef.current) { previewAudioRef.current.pause(); previewAudioRef.current = null; }
+    setPlayingPreview(false);
+  }, [voice]);
+
+  const playPreview = () => {
+    const selectedVoice = config?.voices?.find(v => v.id === voice);
+    const url = selectedVoice?.preview_url;
+    if (!url) return;
+    if (playingPreview && previewAudioRef.current) {
+      previewAudioRef.current.pause();
+      previewAudioRef.current = null;
+      setPlayingPreview(false);
+      return;
+    }
+    const audio = new Audio(url);
+    previewAudioRef.current = audio;
+    setPlayingPreview(true);
+    audio.play();
+    audio.onended = () => { setPlayingPreview(false); previewAudioRef.current = null; };
+    audio.onerror = () => { setPlayingPreview(false); previewAudioRef.current = null; };
+  };
 
   const submit = async () => {
     setError(""); setRunning(true); setProgress(0);
@@ -207,6 +238,7 @@ function AudioModal({ onClose, onDone }) {
       form.append("voice", voice);
       form.append("speed", String(speed));
       form.append("language", "en-US");
+      form.append("model", model);
 
       const r = await fetch(`${API_BASE}/api/audio/generate`, { method: "POST", body: form });
       if (!r.ok) throw new Error(await r.text());
@@ -222,6 +254,7 @@ function AudioModal({ onClose, onDone }) {
 
   const isElevenLabs = config?.provider === "elevenlabs";
   const providerLabel = { elevenlabs: "ElevenLabs", openai: "OpenAI", google: "Google", gemini: "Gemini" }[config?.provider] ?? config?.provider ?? "";
+  const selectedVoicePreviewUrl = config?.voices?.find(v => v.id === voice)?.preview_url;
 
   return (
     <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
@@ -269,20 +302,32 @@ function AudioModal({ onClose, onDone }) {
             </div>
           )}
 
+          {/* Voice selector + preview button */}
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="text-xs text-slate-400 mb-1 block">Voice ({providerLabel})</label>
-              {config && config.voices.length > 0 ? (
-                <select value={voice} onChange={e => setVoice(e.target.value)}
-                  className="w-full bg-slate-900 border border-slate-600 rounded-lg p-2 text-sm text-slate-100">
-                  {config.voices.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
-                </select>
-              ) : (
-                <div className="w-full bg-slate-900 border border-slate-600 rounded-lg p-2 text-sm text-slate-500">
-                  {config ? "Loading voices..." : "Connecting..."}
-                </div>
-              )}
+              <div className="flex gap-1.5">
+                {config && config.voices.length > 0 ? (
+                  <select value={voice} onChange={e => setVoice(e.target.value)}
+                    className="flex-1 bg-slate-900 border border-slate-600 rounded-lg p-2 text-sm text-slate-100">
+                    {config.voices.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+                  </select>
+                ) : (
+                  <div className="flex-1 bg-slate-900 border border-slate-600 rounded-lg p-2 text-sm text-slate-500">
+                    {config ? "Loading voices..." : "Connecting..."}
+                  </div>
+                )}
+                {selectedVoicePreviewUrl && (
+                  <button onClick={playPreview} title={playingPreview ? "Stop preview" : "Play voice sample"}
+                    className={`px-2.5 rounded-lg border transition-colors ${playingPreview
+                      ? "bg-indigo-600 border-indigo-500 text-white"
+                      : "bg-slate-700 border-slate-600 text-slate-300 hover:border-indigo-500 hover:text-white"}`}>
+                    {playingPreview ? <Square size={13} /> : <Play size={13} />}
+                  </button>
+                )}
+              </div>
             </div>
+
             {!isElevenLabs ? (
               <div>
                 <label className="text-xs text-slate-400 mb-1 block">Speed: {speed}x</label>
@@ -291,13 +336,32 @@ function AudioModal({ onClose, onDone }) {
                   className="w-full accent-indigo-500 mt-2" />
               </div>
             ) : (
-              <div className="flex items-end">
-                <div className="text-xs text-yellow-400/80 bg-yellow-900/20 border border-yellow-700/30 rounded-lg p-2 leading-relaxed">
-                  Speed control not available with ElevenLabs free tier
-                </div>
+              <div>
+                <label className="text-xs text-slate-400 mb-1 block">Speed: {speed}x</label>
+                <input type="range" min="0.5" max="2" step="0.1" value={speed}
+                  onChange={e => setSpeed(parseFloat(e.target.value))}
+                  className="w-full accent-indigo-500 mt-2" />
               </div>
             )}
           </div>
+
+          {/* ElevenLabs model selector */}
+          {isElevenLabs && config?.models?.length > 0 && (
+            <div>
+              <label className="text-xs text-slate-400 mb-1.5 block">Model</label>
+              <div className="grid grid-cols-3 gap-2">
+                {config.models.map(m => (
+                  <button key={m.id} onClick={() => setModel(m.id)}
+                    className={`flex flex-col items-start px-3 py-2 rounded-lg border text-left transition-colors ${model === m.id
+                      ? "bg-indigo-600/20 border-indigo-500 text-white"
+                      : "bg-slate-700/50 border-slate-600 text-slate-300 hover:border-slate-500"}`}>
+                    <span className="text-xs font-medium leading-tight">{m.name.split(" — ")[0]}</span>
+                    <span className="text-xs text-slate-400 mt-0.5">{m.cost}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
 
           {running && <ProgressBar value={progress} label={message || "Processing..."} />}
           {error && (
