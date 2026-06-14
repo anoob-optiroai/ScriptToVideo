@@ -314,46 +314,36 @@ function AudioModal({ onClose, onDone }) {
           )}
 
           {/* Voice selector + preview button */}
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="text-xs text-slate-400 mb-1 block">Voice ({providerLabel})</label>
-              <div className="flex gap-1.5">
-                {config && config.voices.length > 0 ? (
-                  <select value={voice} onChange={e => setVoice(e.target.value)}
-                    className="flex-1 bg-slate-900 border border-slate-600 rounded-lg p-2 text-sm text-slate-100">
-                    {config.voices.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
-                  </select>
-                ) : (
-                  <div className="flex-1 bg-slate-900 border border-slate-600 rounded-lg p-2 text-sm text-slate-500">
-                    {config ? "Loading voices..." : "Connecting..."}
-                  </div>
-                )}
-                {selectedVoicePreviewUrl && (
-                  <button onClick={playPreview} title={playingPreview ? "Stop preview" : "Play voice sample"}
-                    className={`px-2.5 rounded-lg border transition-colors ${playingPreview
-                      ? "bg-indigo-600 border-indigo-500 text-white"
-                      : "bg-slate-700 border-slate-600 text-slate-300 hover:border-indigo-500 hover:text-white"}`}>
-                    {playingPreview ? <Square size={13} /> : <Play size={13} />}
-                  </button>
-                )}
-              </div>
+          <div>
+            <label className="text-xs text-slate-400 mb-1 block">Voice ({providerLabel})</label>
+            <div className="flex gap-1.5">
+              {config && config.voices.length > 0 ? (
+                <select value={voice} onChange={e => setVoice(e.target.value)}
+                  className="flex-1 bg-slate-900 border border-slate-600 rounded-lg p-2 text-sm text-slate-100">
+                  {config.voices.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+                </select>
+              ) : (
+                <div className="flex-1 bg-slate-900 border border-slate-600 rounded-lg p-2 text-sm text-slate-500">
+                  {config ? "Loading voices..." : "Connecting..."}
+                </div>
+              )}
+              {selectedVoicePreviewUrl && (
+                <button onClick={playPreview} title={playingPreview ? "Stop preview" : "Play voice sample"}
+                  className={`px-2.5 rounded-lg border transition-colors ${playingPreview
+                    ? "bg-indigo-600 border-indigo-500 text-white"
+                    : "bg-slate-700 border-slate-600 text-slate-300 hover:border-indigo-500 hover:text-white"}`}>
+                  {playingPreview ? <Square size={13} /> : <Play size={13} />}
+                </button>
+              )}
             </div>
+          </div>
 
-            {!isElevenLabs ? (
-              <div>
-                <label className="text-xs text-slate-400 mb-1 block">Speed: {speed}x</label>
-                <input type="range" min="0.5" max="2" step="0.1" value={speed}
-                  onChange={e => setSpeed(parseFloat(e.target.value))}
-                  className="w-full accent-indigo-500 mt-2" />
-              </div>
-            ) : (
-              <div>
-                <label className="text-xs text-slate-400 mb-1 block">Speed: {speed}x</label>
-                <input type="range" min="0.5" max="2" step="0.1" value={speed}
-                  onChange={e => setSpeed(parseFloat(e.target.value))}
-                  className="w-full accent-indigo-500 mt-2" />
-              </div>
-            )}
+          {/* Speed slider */}
+          <div>
+            <label className="text-xs text-slate-400 mb-1 block">Speed: {speed}x</label>
+            <input type="range" min="0.5" max="2" step="0.1" value={speed}
+              onChange={e => setSpeed(parseFloat(e.target.value))}
+              className="w-full accent-indigo-500" />
           </div>
 
           {/* ElevenLabs model selector */}
