@@ -83,10 +83,16 @@ ELEVENLABS_MODELS = [
 def fetch_elevenlabs_voices():
     """Fetch voices from the user's ElevenLabs account, including preview URLs."""
     import requests
+    # Read key fresh from .env each time so saving in Settings works without restarting
+    try:
+        from routers.settings import _read_env
+        api_key = _read_env().get("ELEVENLABS_API_KEY", "") or settings.elevenlabs_api_key
+    except Exception:
+        api_key = settings.elevenlabs_api_key
     try:
         response = requests.get(
             "https://api.elevenlabs.io/v1/voices",
-            headers={"xi-api-key": settings.elevenlabs_api_key},
+            headers={"xi-api-key": api_key},
             timeout=10,
         )
         response.raise_for_status()

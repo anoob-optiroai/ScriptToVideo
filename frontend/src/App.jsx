@@ -74,7 +74,18 @@ function SettingsModal({ onClose, onSaved }) {
   useEffect(() => {
     fetch(`${API_BASE}/api/settings`)
       .then(r => r.json())
-      .then(d => { setForm(f => ({ ...f, tts_provider: d.tts_provider || "elevenlabs", gemini_api_key: d.gemini_api_key || "" })); setLoading(false); })
+      .then(d => {
+        setForm(f => ({
+          ...f,
+          tts_provider:        d.tts_provider        || "elevenlabs",
+          elevenlabs_api_key:  d.elevenlabs_api_key  || "",
+          openai_api_key:      d.openai_api_key       || "",
+          google_cloud_api_key:d.google_cloud_api_key || "",
+          gemini_api_key:      d.gemini_api_key       || "",
+          google_docs_api_key: d.google_docs_api_key  || "",
+        }));
+        setLoading(false);
+      })
       .catch(() => setLoading(false));
   }, []);
 
