@@ -99,10 +99,18 @@ function SettingsModal({ onClose, onSaved }) {
     if (form.google_docs_api_key && !form.google_docs_api_key.includes("*")) body.google_docs_api_key = form.google_docs_api_key;
     try {
       const r = await fetch(`${API_BASE}/api/settings`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-      const d = await r.json();
-      setMsg(d.message || "Saved!");
+      if (!r.ok) { setMsg(`Save failed (${r.status}): ${(await r.json()).detail || ""}`); setSaving(false); return; }
       if (onSaved) onSaved();
-    } catch { setMsg("Save failed."); }
+      // Auto-test ElevenLabs connection after saving
+      if (form.tts_provider === "elevenlabs") {
+        setMsg("Saved! Testing connection…");
+        const t = await fetch(`${API_BASE}/api/audio/test-key`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) });
+        const td = await t.json();
+        setMsg(td.ok ? `✓ ${td.message}` : `✗ ${td.error}`);
+      } else {
+        setMsg("Settings saved.");
+      }
+    } catch (e) { setMsg(`Save failed: ${e.message}`); }
     setSaving(false);
   };
 
@@ -171,7 +179,7 @@ function SettingsModal({ onClose, onSaved }) {
               💡 Keys are saved to <code className="text-slate-300">%APPDATA%\ScriptToVideo\.env</code> on your PC only — never shared.
             </div>
 
-            {msg && <p className={`text-xs text-center ${msg.includes("fail") ? "text-red-400" : "text-green-400"}`}>{msg}</p>}
+            {msg && <p className={`text-xs text-center ${msg.startsWith("✗") || msg.toLowerCase().includes("fail") ? "text-red-400" : "text-green-400"}`}>{msg}</p>}
 
             <div className="flex gap-2 pt-1">
               <button onClick={onClose} className="flex-1 py-2 rounded-lg text-sm bg-slate-700 hover:bg-slate-600 text-slate-300">Cancel</button>

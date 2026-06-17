@@ -113,6 +113,33 @@ def fetch_elevenlabs_voices():
         return [{"id": "", "name": f"Could not load voices: {e}", "preview_url": ""}]
 
 
+@router.post("/test-key")
+def test_elevenlabs_key(body: dict):
+    """Test an ElevenLabs API key and return voice count or error."""
+    import requests as _requests
+    key = (body.get("api_key") or "").strip()
+    if not key:
+        # Test the currently saved key
+        try:
+            from routers.settings import _read_env
+            key = _read_env().get("ELEVENLABS_API_KEY", "") or settings.elevenlabs_api_key
+        except Exception:
+            key = settings.elevenlabs_api_key
+    if not key:
+        return {"ok": False, "error": "No API key saved. Enter your key in the field above and click Save first."}
+    try:
+        r = _requests.get(
+            "https://api.elevenlabs.io/v1/voices",
+            headers={"xi-api-key": key},
+            timeout=10,
+        )
+        r.raise_for_status()
+        count = len(r.json().get("voices", []))
+        return {"ok": True, "voices": count, "message": f"Connected — {count} voices available"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @router.get("/config")
 def get_audio_config():
     """Return the current TTS provider, voices (with preview URLs), and available models."""
