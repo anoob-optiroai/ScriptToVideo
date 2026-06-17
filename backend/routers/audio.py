@@ -116,7 +116,12 @@ def fetch_elevenlabs_voices():
 @router.get("/config")
 def get_audio_config():
     """Return the current TTS provider, voices (with preview URLs), and available models."""
-    provider = settings.tts_provider.lower()
+    # Read provider fresh from .env so Settings changes take effect without restart
+    try:
+        from routers.settings import _read_env
+        provider = (_read_env().get("TTS_PROVIDER", "") or settings.tts_provider).lower()
+    except Exception:
+        provider = settings.tts_provider.lower()
 
     if provider == "elevenlabs":
         voices = fetch_elevenlabs_voices()
