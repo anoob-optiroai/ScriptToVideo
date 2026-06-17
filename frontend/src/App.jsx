@@ -195,7 +195,7 @@ function SettingsModal({ onClose, onSaved }) {
 }
 
 // ── Audio Modal ───────────────────────────────────────────────────────────────
-function AudioModal({ onClose, onDone }) {
+function AudioModal({ onClose, onDone, onOpenSettings }) {
   const [inputMode, setInputMode] = useState("text");
   const [text, setText] = useState("");
   const [url, setUrl] = useState("");
@@ -274,6 +274,8 @@ function AudioModal({ onClose, onDone }) {
   const isElevenLabs = config?.provider === "elevenlabs";
   const providerLabel = { elevenlabs: "ElevenLabs", openai: "OpenAI", google: "Google", gemini: "Gemini" }[config?.provider] ?? config?.provider ?? "";
   const selectedVoicePreviewUrl = config?.voices?.find(v => v.id === voice)?.preview_url;
+  const voicesOk = config && config.voices.length > 0 && config.voices[0].id !== "";
+  const voiceError = !voicesOk && config?.voices?.[0]?.name?.startsWith("Could not load") ? config.voices[0].name : null;
 
   return (
     <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
@@ -318,6 +320,23 @@ function AudioModal({ onClose, onDone }) {
               <Upload size={24} className="mx-auto mb-2 text-slate-400" />
               <p className="text-sm text-slate-400">{file ? file.name : "Click to upload .docx or .txt"}</p>
               <input ref={fileRef} type="file" accept=".docx,.txt" className="hidden" onChange={e => setFile(e.target.files[0])} />
+            </div>
+          )}
+
+          {/* API key error banner */}
+          {voiceError && (
+            <div className="bg-red-900/40 border border-red-700/60 rounded-xl p-3 flex items-start gap-2.5">
+              <AlertCircle size={15} className="text-red-400 mt-0.5 shrink-0" />
+              <div className="flex-1 min-w-0">
+                <p className="text-xs text-red-300 font-medium">ElevenLabs API key not configured</p>
+                <p className="text-xs text-red-400/80 mt-0.5">Go to Settings, paste your ElevenLabs API key, and click Save.</p>
+              </div>
+              {onOpenSettings && (
+                <button onClick={() => { onClose(); onOpenSettings(); }}
+                  className="shrink-0 text-xs bg-red-700/60 hover:bg-red-700 text-white px-2.5 py-1 rounded-lg transition-colors">
+                  Open Settings
+                </button>
+              )}
             </div>
           )}
 
@@ -383,7 +402,8 @@ function AudioModal({ onClose, onDone }) {
 
         <div className="p-5 border-t border-slate-700 flex justify-end gap-3">
           <button onClick={onClose} className="px-4 py-2 text-sm text-slate-400 hover:text-white">Cancel</button>
-          <button onClick={submit} disabled={running}
+          <button onClick={submit} disabled={running || !voicesOk}
+            title={!voicesOk ? "Configure your ElevenLabs API key in Settings first" : ""}
             className="flex items-center gap-2 px-5 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 rounded-xl text-sm font-medium transition-colors">
             {running ? <Loader size={15} className="animate-spin" /> : <Mic size={15} />}
             {running ? "Generating..." : "Generate Audio"}
@@ -2229,7 +2249,7 @@ export default function App() {
         </p>
       </div>
 
-      {showAudio && <AudioModal onClose={() => setShowAudio(false)} onDone={r => setAudioResult(r)} />}
+      {showAudio && <AudioModal onClose={() => setShowAudio(false)} onDone={r => setAudioResult(r)} onOpenSettings={() => setShowSettings(true)} />}
       {showSlides && <SlidesModal onClose={() => setShowSlides(false)} onDone={r => setSlidesResult(r)} />}
       {showLoadProject && (
         <LoadProjectModal
