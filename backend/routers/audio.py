@@ -117,16 +117,27 @@ def fetch_elevenlabs_voices():
 def test_elevenlabs_key(body: dict):
     """Test an ElevenLabs API key and return voice count or error."""
     import requests as _requests
+    from routers.settings import _read_env, _env_path
     key = (body.get("api_key") or "").strip()
+    env_file = "unknown"
+    try:
+        env_file = str(_env_path())
+    except Exception:
+        pass
     if not key:
-        # Test the currently saved key
         try:
-            from routers.settings import _read_env
-            key = _read_env().get("ELEVENLABS_API_KEY", "") or settings.elevenlabs_api_key
+            env = _read_env()
+            key = env.get("ELEVENLABS_API_KEY", "").strip()
         except Exception:
-            key = settings.elevenlabs_api_key
+            pass
     if not key:
-        return {"ok": False, "error": "No API key saved. Enter your key in the field above and click Save first."}
+        key = settings.elevenlabs_api_key or ""
+    key_preview = f"{key[:8]}...({len(key)} chars)" if len(key) > 8 else f"'{key}' ({len(key)} chars)"
+    has_stars = "*" in key
+    if not key:
+        return {"ok": False, "error": f"No API key found in {env_file}. Enter your key in Settings and click Save."}
+    if has_stars:
+        return {"ok": False, "error": f"Saved key contains '*' — it's a masked value, not the real key. Clear the field, paste your key fresh, and Save again. (key: {key_preview})"}
     try:
         r = _requests.get(
             "https://api.elevenlabs.io/v1/voices",
@@ -137,7 +148,7 @@ def test_elevenlabs_key(body: dict):
         count = len(r.json().get("voices", []))
         return {"ok": True, "voices": count, "message": f"Connected — {count} voices available"}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": f"{e} (key: {key_preview}, file: {env_file})"}
 
 
 @router.get("/config")
